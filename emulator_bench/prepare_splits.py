@@ -190,6 +190,10 @@ class StructureResolver:
         self.esm_index = _build_esm_index(args.esm_pdb_dir)
         self.identity_threshold = float(args.identity_threshold)
         self.aligner = _make_aligner()
+        # The cache key includes the identity threshold and a fingerprint of the structure indexes.
+        self.index_fingerprint = stable_hash(
+            json.dumps([sorted(i.items()) for i in (self.experimental_index, self.alphafold_index, self.esm_index)])
+        )
         cache_dir = Path(args.base_dir) / "_structure_alignment_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.sequence_cache_path = cache_dir / "pdb_sequence_cache.json"
@@ -218,6 +222,8 @@ class StructureResolver:
             json.dumps(
                 {
                     "sequence": normalize_sequence(row.get("sequence", "")),
+                    "identity_threshold": self.identity_threshold,
+                    "index_fingerprint": self.index_fingerprint,
                     "candidates": [
                         [_norm_text(item.get("pdbs")), _norm_text(item.get("pdb_source")), _norm_text(item.get("pdb_type"))]
                         for item in candidates
@@ -295,7 +301,9 @@ class StructureResolver:
                 "resolved_structure_status": "unresolved",
                 "resolved_structure_identity": None if best_identity < 0 else round(best_identity, 4),
             }
-        self.selection_cache[task_key] = result
+        # Unresolved results are not cached, so new structures can resolve them later.
+        if result["resolved_structure_status"] != "unresolved":
+            self.selection_cache[task_key] = result
         return dict(result)
 
 
