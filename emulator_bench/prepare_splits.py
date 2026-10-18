@@ -97,22 +97,24 @@ def _extract_pdb_candidates(value) -> List[str]:
     return out
 
 
-def _build_experimental_index(directory: Path) -> Dict[str, str]:
+def _require_structure_dir(directory: Path) -> Path:
     directory = Path(directory).expanduser()
-    return {p.stem.upper(): str(p) for p in directory.glob("*.pdb")} if directory.exists() else {}
+    if not directory.is_dir() or next(directory.iterdir(), None) is None:
+        raise FileNotFoundError(f"Structure directory is missing or empty: {directory}")
+    return directory
+
+
+def _build_experimental_index(directory: Path) -> Dict[str, str]:
+    return {p.stem.upper(): str(p) for p in _require_structure_dir(directory).glob("*.pdb")}
 
 
 def _build_mmcif_index(directory: Path) -> Dict[str, str]:
-    directory = Path(directory).expanduser()
-    return {path.name[:4].upper(): str(path) for path in directory.glob("????_updated.cif")} if directory.exists() else {}
+    return {path.name[:4].upper(): str(path) for path in _require_structure_dir(directory).glob("????_updated.cif")}
 
 
 def _build_alphafold_index(directory: Path) -> Dict[str, str]:
-    directory = Path(directory).expanduser()
-    if not directory.exists():
-        return {}
     index: Dict[str, Tuple[int, str]] = {}
-    for path in directory.glob("AF-*-F1-model_v*.pdb"):
+    for path in _require_structure_dir(directory).glob("AF-*-F1-model_v*.pdb"):
         stem = path.stem
         accession, _, version_text = stem[len("AF-") :].partition("-F1-model_v")
         try:
@@ -129,10 +131,7 @@ def _build_esm_index(*directories: Path) -> Dict[str, str]:
     """Map UniProt accession to an ESMFold2 structure. Earlier directories win over later ones."""
     index: Dict[str, str] = {}
     for directory in directories:
-        directory = Path(directory).expanduser()
-        if not directory.exists():
-            continue
-        for path in directory.glob("ESMFold2-*"):
+        for path in _require_structure_dir(directory).glob("ESMFold2-*"):
             if path.suffix in {".pdb", ".cif"}:
                 index.setdefault(path.name[len("ESMFold2-") : -4].upper(), str(path))
     return index

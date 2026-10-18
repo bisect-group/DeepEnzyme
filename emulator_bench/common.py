@@ -159,7 +159,7 @@ def discover_split_jobs(base_dir: Path, split_groups=None, thresholds=None) -> L
             jobs.append(
                 {
                     "split_group": split_group,
-                    "split_name": split_group,
+                    "split_name": "all",
                     "root_dir": str(group_dir),
                     "train_path": str(direct["train"]),
                     "val_path": str(direct["val"]),

@@ -32,12 +32,12 @@ Paper and code: the paper has no hyperparameter table, so there is no conflict. 
 the code in three places (see below).
 
 ## What the wrapper does now
-`run_split_benchmarks.py` (defaults: `--base_dir` kcat task dir, `--work_dir` `EMULaToR/outputs/baselines/DeepEnzyme`) runs, for every split folder found on disk:
+`run_split_benchmarks.py` (defaults: `--base_dir` kcat task dir, `--work_dir` `EMULaToR/outputs/baselines/DeepEnzyme`, called `OUT`) runs, for every split folder found on disk:
 `prepare_splits.py` (structure per row), `cache_features.py` (static features, persistent cache),
 then `train_single_target_tvt.py` for each seed (default 666 777 888).
 Split folders: random_splits_grouped_sequence, random_splits_grouped_smiles, uniprot_time_splits,
 enzyme_sequence_splits/threshold_*, substrate_splits/threshold_* (thresholds found on disk). 5 jobs, 15 runs.
-All outputs go under `--work_dir`. Nothing is written under `data/`. The model trains on log2(kcat); metrics and predictions are in log10.
+All outputs go under `--work_dir`: runs in `OUT/<task>/<split_group>/<split_name>/seed_N`, feature cache in `OUT/embeddings/features_v3`. Nothing is written under `data/`. The model trains on log2(kcat); metrics and predictions are in log10.
 Test metrics come from the last-epoch model.
 
 ## Files removed
@@ -55,7 +55,7 @@ and `benchmark_config.example.json` (both used grid/Optuna-style keys and stale 
   `run_summary.json` has `final_epoch` and `final_val_rmse`.
 - `prepare_splits.py`: ESM folder is now `data/intermediate/esmfold2_pdb` with prefix `ESMFold2-`
   (the old `esm/ESM3-open-small-*` folder does not exist). Paths derive from the EMULaToR root, not a home dir.
-  Structure cache lives in `<work_dir>/manifests/_structure_alignment_cache`.
+  Structure cache lives in `<work_dir>/<task>/manifests/_structure_alignment_cache`.
 - `cache_features.py`: path arguments are required. Default dictionary dir is `<submodule>/Data/Input`.
 - `aggregate_deepenzyme_results.py`: `--results_dir` required. Output default `<results_dir>/aggregate_deepenzyme_results.csv`.
 - `README.md`, `commands.txt`: rewritten for the EMULaToR layout.
@@ -118,7 +118,7 @@ Notes:
 - Rows: new resolver (see "Structure coverage"), CIF/mmCIF reader, `--esm_cif_dir` and `--mmcif_dir` options in `prepare_splits.py`. `_candidate_lookup` reads `<task>_kinetic_params_3d.parquet` by task folder name.
 - Stale-cache guards: prepared manifests carry an `index_fingerprint` (structure indexes plus a resolver version) and are rebuilt when it differs. Feature folders store the label, the manifest size and mtime, and `--limit_rows`, and are rebuilt when any of them differs. A rerun of the same command skips both stages (checked).
 - Summaries report std, not variance: `run_split_benchmarks.summarize` (`*_mean`, `*_std`) and `aggregate_deepenzyme_results.py` (both used variance).
-- `--base_dir` and `--work_dir` have defaults (kcat task dir; `EMULaToR/outputs/baselines/DeepEnzyme`, computed from the file location). Paths are resolved to absolute before the subprocesses run in the submodule root. The aggregate script default `--results_dir` is `<default work_dir>/results` and it adds the repo root to `sys.path`.
+- `--base_dir` and `--work_dir` have defaults (kcat task dir; `EMULaToR/outputs/baselines/DeepEnzyme`, computed from the file location). Paths are resolved to absolute before the subprocesses run in the submodule root. The aggregate script default `--results_dir` is `<default work_dir>/<task>` and it adds the repo root to `sys.path`.
 - README and `commands.txt` updated (no `runs/kcat` path, no variance, no `--target_transform`).
 - Smoke after the changes (mldb, GPU 1, 1-2 epochs, 100 rows per split, kcat random_splits_grouped_sequence subset): prepare, cache, train, and metrics worked. Predictions are in log10 (the `Loss` column is about 25, the log2 MSE; RMSE about 1.5). A second smoke used 25 rows per split that were resolved as raw mmCIF and ESMFold2 CIF: 0 featurization failures, 1 epoch trained. Outputs: `scratchpad/bench_smoke/DeepEnzyme/{w2,w3}`. Coverage runs: `.../{before,after_esm_only,after,before_km,after_km}`.
 - Speed note for the coverage run: PDB chain sequences for 9,697 experimental entries were parsed once in parallel (scratch script) and seeded into the resolver cache. The wrapper itself parses them one at a time and caches them, so a first `prepare_splits.py` run is slow (tens of minutes).

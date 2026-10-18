@@ -1,27 +1,32 @@
 # DeepEnzyme emulator_bench commands (kcat only)
 # Run from the DeepEnzyme submodule root: EMULaToR/baselines/DeepEnzyme
-# PY=/home/adhil/.conda/envs/mldb/bin/python
+# The paths below are absolute, so they also work from another folder if you use the full script path.
+PY=/home/adhil/.conda/envs/mldb/bin/python
+EM=/home/adhil/github/EMULaToR
+DATA=$EM/data/processed/datasets/kinetic_dataset/kcat
+OUT=$EM/outputs/baselines/DeepEnzyme
 
-# Defaults: --base_dir EMULaToR/data/processed/datasets/kinetic_dataset/kcat,
-#           --work_dir EMULaToR/outputs/baselines/DeepEnzyme.
-DATA=../../data/processed/datasets/kinetic_dataset/kcat
-WORK=../../outputs/baselines/DeepEnzyme
+# Defaults: --base_dir $DATA, --work_dir $OUT.
+# Runs:    $OUT/kcat/<split_group>/<split_name>/seed_N  (split_name is threshold_* or all)
+# Cache:   $OUT/embeddings/features_v3
+# Summary: $OUT/kcat/*.csv
 
 # Prepare structures, cache features and train every default split for three seeds.
 # Split groups: random_splits_grouped_sequence, random_splits_grouped_smiles, uniprot_time_splits,
 # enzyme_sequence_splits/threshold_*, substrate_splits/threshold_* (thresholds are found on disk).
 CUDA_VISIBLE_DEVICES=0 $PY emulator_bench/run_split_benchmarks.py \
-  --base_dir $DATA --work_dir $WORK --seeds 666 777 888
+  --base_dir $DATA --work_dir $OUT --seeds 666 777 888
 
 # Run jobs in parallel on several GPUs.
 $PY emulator_bench/run_split_benchmarks.py \
-  --base_dir $DATA --work_dir $WORK --seeds 666 777 888 \
+  --base_dir $DATA --work_dir $OUT --seeds 666 777 888 \
   --gpus 0 1 --runs_per_gpu 2
 
-# Smoke test: one split, one seed, 100 rows per split, one epoch.
+# Smoke test: one split, one seed, 100 rows per split, one epoch. SCRATCH is any scratch folder.
+SCRATCH=/path/to/scratch
 CUDA_VISIBLE_DEVICES=1 $PY emulator_bench/run_split_benchmarks.py \
-  --base_dir $DATA --work_dir <scratch_dir> --split_groups random_splits_grouped_sequence \
+  --base_dir $DATA --work_dir $SCRATCH --split_groups random_splits_grouped_sequence \
   --seeds 666 --limit_rows 100 --iteration 1
 
-# Aggregate mean and std over seeds.
-$PY emulator_bench/aggregate_deepenzyme_results.py --results_dir $WORK/results
+# Aggregate mean and std over seeds. Standalone scripts need explicit folders.
+$PY emulator_bench/aggregate_deepenzyme_results.py --results_dir $OUT/kcat

@@ -222,7 +222,7 @@ def main(args):
         "test": load_split_dataset(Path(args.test_dir), device),
     }
 
-    last_checkpoint = out_dir / "last_checkpoint.pt"
+    last_checkpoint = out_dir / "checkpoint_last.pt"
     start_epoch, records = 0, []
     if last_checkpoint.exists() and not args.overwrite:
         start_epoch, records = load_checkpoint(last_checkpoint, model, optimizer, scheduler, scaler, device)

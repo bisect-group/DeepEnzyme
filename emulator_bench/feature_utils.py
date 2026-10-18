@@ -217,7 +217,7 @@ def protein_contact_map(pdb_path, seq, dist_thres=10.0, chain_id="A"):
 
 class FeatureCache:
     def __init__(self, cache_dir):
-        self.cache_root = _ensure_dir(cache_dir)
+        self.cache_root = _ensure_dir(Path(cache_dir) / f"features_{CACHE_VERSION}")
         self.seq_dir = _ensure_dir(self.cache_root / "sequence")
         self.smiles_dir = _ensure_dir(self.cache_root / "smiles")
         self.struct_dir = _ensure_dir(self.cache_root / "structure")

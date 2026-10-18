@@ -255,7 +255,7 @@ def summarize(results_dir: Path):
 def main():
     parser = argparse.ArgumentParser(description="Run original-settings DeepEnzyme training across EMULaToR split jobs.")
     parser.add_argument("--base_dir", type=Path, default=DEFAULT_BASE_DIR, help="Task directory, e.g. data/processed/datasets/kinetic_dataset/kcat.")
-    parser.add_argument("--work_dir", type=Path, default=DEFAULT_WORK_DIR, help="Output root for manifests, features, caches and results.")
+    parser.add_argument("--work_dir", type=Path, default=DEFAULT_WORK_DIR, help="Output root OUT. Runs go to <work_dir>/<task>/<split_group>/<split_name>/seed_N; the cache goes to <work_dir>/embeddings.")
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
     parser.add_argument("--threshold", type=str, default=None)
     parser.add_argument("--thresholds", nargs="+", default=None)
@@ -285,10 +285,11 @@ def main():
 
     args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
     args.base_dir, args.work_dir, args.dict_dir = (Path(os.path.abspath(path)) for path in (args.base_dir, args.work_dir, args.dict_dir))
-    args.manifests_dir = args.work_dir / "manifests"
-    args.features_dir = args.work_dir / "features"
+    args.task_dir = args.work_dir / args.base_dir.name
+    args.manifests_dir = args.task_dir / "manifests"
+    args.features_dir = args.task_dir / "features"
     args.cache_dir = args.work_dir / "embeddings"
-    args.results_dir = args.work_dir / "results"
+    args.results_dir = args.task_dir
 
     if args.runs_per_gpu < 1:
         raise ValueError("--runs_per_gpu must be >= 1")

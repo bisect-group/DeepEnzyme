@@ -7,7 +7,8 @@ split.
 
 Directory layouts handled:
   <results_dir>/<split_group>/threshold_X/seed_N
-  <results_dir>/<split_group>/<split_group>/seed_N
+  <results_dir>/<split_group>/all/seed_N
+where <results_dir> is <work_dir>/<task>.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from emulator_bench.common import DEFAULT_WORK_DIR
+from emulator_bench.common import DEFAULT_BASE_DIR, DEFAULT_WORK_DIR
 
 
 SPLITS = ("train", "val", "test")
@@ -111,7 +112,7 @@ def aggregate(rows: list[dict]) -> pd.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--results_dir", type=Path, default=DEFAULT_WORK_DIR / "results", help="<work_dir>/results written by run_split_benchmarks.py.")
+    parser.add_argument("--results_dir", type=Path, default=DEFAULT_WORK_DIR / DEFAULT_BASE_DIR.name, help="<work_dir>/<task> written by run_split_benchmarks.py.")
     parser.add_argument("--output", type=Path, default=None, help="Default: <results_dir>/aggregate_deepenzyme_results.csv.")
     return parser.parse_args()
 
