@@ -1,4 +1,5 @@
 import argparse
+import math
 import json
 import os
 import sys
@@ -26,6 +27,11 @@ from emulator_bench.feature_utils import load_pickle
 from emulator_bench.modeling_fast import DeepEnzymeBench
 
 
+# The model trains on log2(kcat) as in the original code. Metrics and predictions are in log10 so they compare across baselines.
+# "Loss" stays the MSE of the log2 training target.
+LOG10_OF_2 = math.log10(2.0)
+
+
 def load_tensor(file_name, dtype, device):
     np_dtype = np.int64 if dtype is torch.LongTensor else np.float32
     torch_dtype = torch.long if dtype is torch.LongTensor else torch.float32
@@ -43,6 +49,11 @@ def load_split_dataset(split_dir: Path, device):
     proteinadjacencies = np.load(split_dir / "proteinadjacencies.npy", allow_pickle=True)
     labels = load_tensor(str(split_dir / "logkcat"), torch.FloatTensor, device)
     return list(zip(fingerprint, smileadjacencies, sequences, proteinadjacencies, labels))
+
+
+def rows_dropped(split_dir: Path) -> int:
+    """Rows that the original featurizer cannot build. cache_features.py drops them and counts them."""
+    return int(json.loads((Path(split_dir) / "feature_summary.json").read_text())["rows_failed"])
 
 
 def build_model(args, dict_dir: Path, device):
@@ -94,7 +105,7 @@ def train_epoch(model, dataset, optimizer, loss_fn, args, device, amp_dtype, sca
         sse += (pred_value - label_value) ** 2
         if not args.hide_sample_progress and (idx == 1 or idx % args.progress_interval == 0 or idx == len(dataset)):
             iterator.set_postfix(rmse=f"{(sse / idx) ** 0.5:.4g}")
-    metrics = metric_dict(y_true, y_pred)
+    metrics = metric_dict(np.asarray(y_true) * LOG10_OF_2, np.asarray(y_pred) * LOG10_OF_2)
     metrics["Loss"] = total_loss / max(1, len(dataset))
     return metrics
 
@@ -119,9 +130,10 @@ def evaluate(model, dataset, loss_fn, args, device, amp_dtype, desc):
         sse += (pred_value - label_value) ** 2
         if not args.hide_sample_progress and (idx == 1 or idx % args.progress_interval == 0 or idx == len(dataset)):
             iterator.set_postfix(rmse=f"{(sse / idx) ** 0.5:.4g}")
+    y_true, y_pred = np.asarray(y_true) * LOG10_OF_2, np.asarray(y_pred) * LOG10_OF_2
     metrics = metric_dict(y_true, y_pred)
     metrics["Loss"] = total_loss / max(1, len(dataset))
-    return metrics, np.asarray(y_true), np.asarray(y_pred)
+    return metrics, y_true, y_pred
 
 
 def _rng_state():
@@ -143,14 +155,13 @@ def _set_rng_state(state):
         torch.cuda.set_rng_state_all([item.cpu() for item in state["cuda"]])
 
 
-def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, best_val_rmse, records, args):
+def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, records, args):
     payload = {
         "epoch": int(epoch),
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "scaler_state": scaler.state_dict() if scaler is not None else None,
-        "best_val_rmse": float(best_val_rmse),
         "records": records,
         "rng_state": _rng_state(),
         "args": vars(args),
@@ -168,7 +179,7 @@ def load_checkpoint(path, model, optimizer, scheduler, scaler, device):
     if scaler is not None and checkpoint.get("scaler_state"):
         scaler.load_state_dict(checkpoint["scaler_state"])
     _set_rng_state(checkpoint.get("rng_state"))
-    return int(checkpoint["epoch"]), float(checkpoint["best_val_rmse"]), list(checkpoint.get("records", []))
+    return int(checkpoint["epoch"]), list(checkpoint.get("records", []))
 
 
 def write_final_outputs(model, datasets, loss_fn, args, device, amp_dtype, out_dir: Path):
@@ -195,13 +206,7 @@ def main(args):
 
     set_seed(args.seed)
     device = resolve_device(args.device)
-    if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
-    amp_dtype, precision_mode = resolve_amp_dtype(device)
-    if args.no_amp:
-        amp_dtype, precision_mode = None, "fp32"
+    amp_dtype, precision_mode = resolve_amp_dtype(device) if args.amp else (None, "fp32")
     print(f"Device: {device} | precision: {precision_mode} | CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<not-set>')}")
 
     model, n_fingerprint, n_word = build_model(args, Path(args.dict_dir), device)
@@ -218,11 +223,10 @@ def main(args):
     }
 
     last_checkpoint = out_dir / "last_checkpoint.pt"
-    best_checkpoint = out_dir / "best_checkpoint.pt"
-    start_epoch, best_val_rmse, records = 0, float("inf"), []
+    start_epoch, records = 0, []
     if last_checkpoint.exists() and not args.overwrite:
-        start_epoch, best_val_rmse, records = load_checkpoint(last_checkpoint, model, optimizer, scheduler, scaler, device)
-        print(f"Resumed from epoch {start_epoch}; best_val_rmse={best_val_rmse:.6g}")
+        start_epoch, records = load_checkpoint(last_checkpoint, model, optimizer, scheduler, scaler, device)
+        print(f"Resumed from epoch {start_epoch}")
 
     headers = [
         "Epoch",
@@ -258,7 +262,7 @@ def main(args):
         epoch_iter.set_postfix(train_rmse=f"{train_metrics['RMSE']:.4g}")
         epoch_iter.set_postfix(phase="val")
         val_metrics, _val_y, _val_pred = evaluate(model, datasets["val"], loss_fn, args, device, amp_dtype, desc="val")
-        epoch_iter.set_postfix(val_rmse=f"{val_metrics['RMSE']:.4g}", best_val=f"{min(best_val_rmse, val_metrics['RMSE']):.4g}")
+        epoch_iter.set_postfix(val_rmse=f"{val_metrics['RMSE']:.4g}")
         epoch_iter.set_postfix(phase="test")
         test_metrics, _test_y, _test_pred = evaluate(model, datasets["test"], loss_fn, args, device, amp_dtype, desc="test")
 
@@ -286,19 +290,11 @@ def main(args):
         }
         records.append(row)
         atomic_csv(out_dir / "logfile.csv", pd.DataFrame(records, columns=headers))
-        if val_metrics["RMSE"] < best_val_rmse:
-            best_val_rmse = float(val_metrics["RMSE"])
-            save_checkpoint(best_checkpoint, epoch, model, optimizer, scheduler, scaler, best_val_rmse, records, args)
-        save_checkpoint(last_checkpoint, epoch, model, optimizer, scheduler, scaler, best_val_rmse, records, args)
+        save_checkpoint(last_checkpoint, epoch, model, optimizer, scheduler, scaler, records, args)
         epoch_iter.set_postfix(test_rmse=f"{test_metrics['RMSE']:.4g}", lr=f"{optimizer.param_groups[0]['lr']:.3g}")
         if args.log_json:
             write(json.dumps(row))
 
-    if not best_checkpoint.exists():
-        save_checkpoint(best_checkpoint, args.iteration, model, optimizer, scheduler, scaler, best_val_rmse, records, args)
-
-    best_payload = torch_load(best_checkpoint, map_location=device)
-    model.load_state_dict(best_payload["model_state"])
     write_final_outputs(model, datasets, loss_fn, args, device, amp_dtype, out_dir)
     atomic_json(
         out_dir / "run_summary.json",
@@ -307,26 +303,27 @@ def main(args):
             "train_size": len(datasets["train"]),
             "val_size": len(datasets["val"]),
             "test_size": len(datasets["test"]),
-            "best_epoch": int(best_payload["epoch"]),
-            "best_val_rmse": float(best_payload["best_val_rmse"]),
+            "final_epoch": int(args.iteration),
+            "final_val_rmse": float(records[-1]["RMSE_val"]),
+            "rows_dropped": {name: rows_dropped(getattr(args, f"{name}_dir")) for name in datasets},
             "precision": precision_mode,
             "n_fingerprint": int(n_fingerprint),
             "n_word": int(n_word),
         },
     )
-    atomic_json(out_dir / "completed.json", {"completed": True, "best_epoch": int(best_payload["epoch"])})
+    atomic_json(out_dir / "completed.json", {"completed": True, "final_epoch": int(args.iteration)})
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Resumable DeepEnzyme train/val/test retraining with original defaults.")
+    parser = argparse.ArgumentParser(description="Resumable DeepEnzyme train/val/test training with original defaults. The final model is the last epoch, as in the original code.")
     parser.add_argument("--train_dir", required=True, type=str)
     parser.add_argument("--val_dir", required=True, type=str)
     parser.add_argument("--test_dir", required=True, type=str)
     parser.add_argument("--out_dir", required=True, type=str)
-    parser.add_argument("--dict_dir", default="Data/Input", type=str)
+    parser.add_argument("--dict_dir", default=str(REPO_ROOT / "Data/Input"), type=str)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu", type=str)
     parser.add_argument("--seed", default=666, type=int)
-    parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--amp", action="store_true", help="Opt in to mixed precision. The original code trains in fp32.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--log_json", action="store_true", help="Print one JSON metrics row per epoch to stdout.")
     parser.add_argument("--show_sample_progress", action="store_true", help="Deprecated compatibility flag; sample progress is shown by default.")
@@ -337,7 +334,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--lr", default=0.001, type=float)
     parser.add_argument("--iteration", default=200, type=int)
-    parser.add_argument("--weight_decay", default=1e-6, type=float)
+    parser.add_argument("--weight_decay", default=0.01, type=float, help="torch.optim.AdamW default, which the original code uses.")
     parser.add_argument("--dropout", default=0.3, type=float)
     parser.add_argument("--dim", default=64, type=int)
     parser.add_argument("--layer_output", default=3, type=int)

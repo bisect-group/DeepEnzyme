@@ -1,7 +1,6 @@
 import argparse
 import ast
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -12,20 +11,18 @@ from Bio.Align import PairwiseAligner
 from Bio.PDB import PDBParser, is_aa
 from Bio.SeqUtils import seq1
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import (
-    DEFAULT_BASE_DIR,
-    DEFAULT_MANIFESTS_DIR,
     DEFAULT_SPLIT_GROUPS,
     KEY_COLUMNS,
     atomic_json,
@@ -41,10 +38,14 @@ from emulator_bench.common import (
 )
 
 
-DEFAULT_EXPERIMENTAL_PDB_DIR = Path("/home/adhil/github/EMULaToR/data/intermediate/processed_exp_pdb")
-DEFAULT_ALPHAFOLD_PDB_DIR = Path("/home/adhil/github/EMULaToR/data/intermediate/alphafold")
-DEFAULT_ESM_PDB_DIR = Path("/home/adhil/github/EMULaToR/data/intermediate/esm")
+DEFAULT_EXPERIMENTAL_PDB_DIR = REPO_ROOT.parents[1] / "data/intermediate/processed_exp_pdb"
+DEFAULT_ALPHAFOLD_PDB_DIR = REPO_ROOT.parents[1] / "data/intermediate/alphafold"
+DEFAULT_ESM_PDB_DIR = REPO_ROOT.parents[1] / "data/intermediate/esmfold2_pdb"
+DEFAULT_MMCIF_DIR = REPO_ROOT.parents[1] / "data/intermediate/mmcif"
+DEFAULT_ESM_CIF_DIR = REPO_ROOT.parents[1] / "data/intermediate/esmfold2_cif"
 PDB_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])([0-9][A-Za-z0-9]{3})(?![A-Za-z0-9])")
+# Bump when the selection rules change, so prepared manifests from older rules are rebuilt.
+RESOLVER_VERSION = 3
 STRUCTURE_MATCH_COLUMNS = ["smiles", "sequence", "value", "smiles_hash", "log10_value"]
 
 
@@ -101,6 +102,11 @@ def _build_experimental_index(directory: Path) -> Dict[str, str]:
     return {p.stem.upper(): str(p) for p in directory.glob("*.pdb")} if directory.exists() else {}
 
 
+def _build_mmcif_index(directory: Path) -> Dict[str, str]:
+    directory = Path(directory).expanduser()
+    return {path.name[:4].upper(): str(path) for path in directory.glob("????_updated.cif")} if directory.exists() else {}
+
+
 def _build_alphafold_index(directory: Path) -> Dict[str, str]:
     directory = Path(directory).expanduser()
     if not directory.exists():
@@ -119,16 +125,16 @@ def _build_alphafold_index(directory: Path) -> Dict[str, str]:
     return {key: path for key, (_version, path) in index.items()}
 
 
-def _build_esm_index(directory: Path) -> Dict[str, str]:
-    directory = Path(directory).expanduser()
-    if not directory.exists():
-        return {}
-    index = {}
-    prefix = "ESM3-open-small-"
-    for path in directory.glob(f"{prefix}*.pdb"):
-        key = path.name[len(prefix) : -4]
-        index[key] = str(path)
-        index[key.upper()] = str(path)
+def _build_esm_index(*directories: Path) -> Dict[str, str]:
+    """Map UniProt accession to an ESMFold2 structure. Earlier directories win over later ones."""
+    index: Dict[str, str] = {}
+    for directory in directories:
+        directory = Path(directory).expanduser()
+        if not directory.exists():
+            continue
+        for path in directory.glob("ESMFold2-*"):
+            if path.suffix in {".pdb", ".cif"}:
+                index.setdefault(path.name[len("ESMFold2-") : -4].upper(), str(path))
     return index
 
 
@@ -169,13 +175,13 @@ def _row_key(row: dict) -> str:
 
 
 def _candidate_lookup(base_dir: Path) -> Dict[str, List[dict]]:
-    path = base_dir / "kcat_kinetic_params_3d.parquet"
+    path = base_dir / f"{base_dir.name}_kinetic_params_3d.parquet"
     if not path.exists():
         raise FileNotFoundError(f"Missing 3D candidate parquet: {path}")
     frame = read_table(path)
-    require_columns(frame, KEY_COLUMNS + ["pdbs", "pdb_source", "pdb_type"], path)
+    require_columns(frame, KEY_COLUMNS + ["pdbs", "pdb_source", "pdb_type", "uniprot_id", "pdb_chain", "pdb_coverage"], path)
     lookup: Dict[str, List[dict]] = {}
-    columns = KEY_COLUMNS + ["pdbs", "pdb_source", "pdb_type"]
+    columns = KEY_COLUMNS + ["pdbs", "pdb_source", "pdb_type", "uniprot_id", "pdb_chain", "pdb_coverage"]
     for row in frame[columns].to_dict("records"):
         lookup.setdefault(_row_key(row), []).append(row)
         seq_key = "sequence:" + stable_hash(normalize_sequence(row.get("sequence", "")))
@@ -187,14 +193,15 @@ class StructureResolver:
     def __init__(self, args):
         self.experimental_index = _build_experimental_index(args.experimental_pdb_dir)
         self.alphafold_index = _build_alphafold_index(args.alphafold_pdb_dir)
-        self.esm_index = _build_esm_index(args.esm_pdb_dir)
+        self.esm_index = _build_esm_index(args.esm_pdb_dir, args.esm_cif_dir)
+        self.mmcif_index = _build_mmcif_index(args.mmcif_dir)
         self.identity_threshold = float(args.identity_threshold)
         self.aligner = _make_aligner()
         # The cache key includes the identity threshold and a fingerprint of the structure indexes.
         self.index_fingerprint = stable_hash(
-            json.dumps([sorted(i.items()) for i in (self.experimental_index, self.alphafold_index, self.esm_index)])
+            json.dumps([RESOLVER_VERSION] + [sorted(i.items()) for i in (self.experimental_index, self.alphafold_index, self.esm_index, self.mmcif_index)])
         )
-        cache_dir = Path(args.base_dir) / "_structure_alignment_cache"
+        cache_dir = Path(args.manifests_dir) / "_structure_alignment_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.sequence_cache_path = cache_dir / "pdb_sequence_cache.json"
         self.selection_cache_path = cache_dir / "selection_cache.json"
@@ -225,7 +232,7 @@ class StructureResolver:
                     "identity_threshold": self.identity_threshold,
                     "index_fingerprint": self.index_fingerprint,
                     "candidates": [
-                        [_norm_text(item.get("pdbs")), _norm_text(item.get("pdb_source")), _norm_text(item.get("pdb_type"))]
+                        [_norm_text(item.get(column)) for column in ("pdbs", "pdb_source", "pdb_type", "uniprot_id", "pdb_chain", "pdb_coverage")]
                         for item in candidates
                     ],
                 },
@@ -236,21 +243,22 @@ class StructureResolver:
             return dict(self.selection_cache[task_key])
 
         sequence = normalize_sequence(row.get("sequence", ""))
-        exp_candidates, alpha_candidates, esm_candidates = [], [], []
+        exp_candidates, tokens, mmcif_candidates = [], set(), []
         for item in candidates:
             pdbs = _norm_text(item.get("pdbs"))
-            source = _norm_text(item.get("pdb_source")).lower()
-            kind = _norm_text(item.get("pdb_type")).lower()
-            if kind == "experimental" or source == "pdbe":
-                exp_candidates.extend(pdb for pdb in _extract_pdb_candidates(pdbs) if pdb.upper() in self.experimental_index)
-            elif kind == "predicted" and source == "alphafold":
-                accession = pdbs.split("|", 1)[0].upper()
-                if accession in self.alphafold_index:
-                    alpha_candidates.append(accession)
-            else:
-                key = pdbs if pdbs in self.esm_index else pdbs.upper()
-                if key in self.esm_index:
-                    esm_candidates.append(key)
+            if _norm_text(item.get("pdb_type")).lower() == "experimental" or _norm_text(item.get("pdb_source")).lower() == "pdbe":
+                pdb_ids = [pdb.upper() for pdb in _extract_pdb_candidates(pdbs)]
+                exp_candidates.extend(pdb for pdb in pdb_ids if pdb in self.experimental_index)
+                coverage = float(_norm_text(item.get("pdb_coverage")) or 0.0)
+                mmcif_candidates.extend((coverage, pdb, _norm_text(item.get("pdb_chain"))) for pdb in pdb_ids if pdb in self.mmcif_index)
+            # Predicted structures are keyed by UniProt accession: "<accession>", "<pdb>:<accession>", or "<accession>|<mutation>".
+            tokens.update(token.upper() for token in (pdbs.split(":")[-1], _norm_text(item.get("uniprot_id"))) if token)
+        accessions = {token.split("|")[0] for token in tokens}
+        alpha_candidates = [accession for accession in accessions if accession in self.alphafold_index]
+        # An ESMFold2 file named "<accession>|<mutation>" wins over the wild-type accession file.
+        esm_candidates = sorted(token for token in tokens if "|" in token and token in self.esm_index) + sorted(
+            accession for accession in accessions if accession in self.esm_index
+        )
 
         best_pdb, best_chain, best_identity = None, "", -1.0
         for pdb_id in sorted(set(p.upper() for p in exp_candidates)):
@@ -281,7 +289,7 @@ class StructureResolver:
                 "resolved_structure_identity": None if best_identity < 0 else round(best_identity, 4),
             }
         elif esm_candidates:
-            key = sorted(set(esm_candidates))[0]
+            key = esm_candidates[0]
             result = {
                 "structure_path": self.esm_index[key],
                 "pdbs": key,
@@ -289,6 +297,18 @@ class StructureResolver:
                 "pdb_type": "predicted",
                 "chain_id": "A",
                 "resolved_structure_status": "selected_esm",
+                "resolved_structure_identity": None if best_identity < 0 else round(best_identity, 4),
+            }
+        elif mmcif_candidates:
+            # Last resort: the raw experimental mmCIF entry, chain and coverage as mapped in the 3D candidate table.
+            _coverage, pdb_id, chain = max(mmcif_candidates, key=lambda item: (item[0], item[1]))
+            result = {
+                "structure_path": self.mmcif_index[pdb_id],
+                "pdbs": pdb_id,
+                "pdb_source": "PDBe",
+                "pdb_type": "experimental",
+                "chain_id": chain or "A",
+                "resolved_structure_status": "selected_mmcif",
                 "resolved_structure_identity": None if best_identity < 0 else round(best_identity, 4),
             }
         else:
@@ -316,6 +336,7 @@ def prepare_one_split(path: Path, output_path: Path, candidates: Dict[str, List[
     require_columns(frame, KEY_COLUMNS, path)
     if args.limit_rows:
         frame = frame.head(args.limit_rows).copy()
+    source_fingerprint = _source_fingerprint(path, args.limit_rows)
     rows = []
     failed = 0
     for row in progress(frame.to_dict("records"), desc=f"Preparing {path.parent.name}/{path.name}", unit="row"):
@@ -332,27 +353,38 @@ def prepare_one_split(path: Path, output_path: Path, candidates: Dict[str, List[
         out["sample_id"] = _sample_id(row)
         out["target"] = float(row[args.target_col])
         out.update(result)
+        out["index_fingerprint"] = resolver.index_fingerprint
+        out["source_fingerprint"] = source_fingerprint
         rows.append(out)
     out_frame = pd.DataFrame(rows)
     write_table(output_path, out_frame)
     return {"input_path": str(path), "output_path": str(output_path), "rows_in": int(len(frame)), "rows_out": int(len(out_frame)), "rows_unresolved": int(failed)}
 
 
-def prepared_manifest_is_valid(path: Path) -> bool:
+def _source_fingerprint(source_path: Path, limit_rows: Optional[int]) -> str:
+    stat = Path(source_path).stat()
+    return stable_hash(json.dumps([str(Path(source_path).resolve()), stat.st_size, stat.st_mtime_ns, limit_rows or 0]))
+
+
+def prepared_manifest_is_valid(path: Path, index_fingerprint: str, source_fingerprint: str) -> bool:
     if not path.exists():
         return False
     try:
         frame = read_table(path)
     except Exception:
         return False
-    required = {"sequence", "smiles", "structure_path", "chain_id", "target"}
-    return bool(required.issubset(frame.columns))
+    required = {"sequence", "smiles", "structure_path", "chain_id", "target", "index_fingerprint", "source_fingerprint"}
+    return (
+        required.issubset(frame.columns)
+        and set(frame["index_fingerprint"]) == {index_fingerprint}
+        and set(frame["source_fingerprint"]) == {source_fingerprint}
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare DeepEnzyme EMULaToR split manifests with one resolved structure per row.")
-    parser.add_argument("--base_dir", type=Path, default=DEFAULT_BASE_DIR)
-    parser.add_argument("--manifests_dir", type=Path, default=DEFAULT_MANIFESTS_DIR)
+    parser.add_argument("--base_dir", type=Path, required=True, help="Task directory, e.g. data/processed/datasets/kinetic_dataset/kcat.")
+    parser.add_argument("--manifests_dir", type=Path, required=True)
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
     parser.add_argument("--threshold", type=str, default=None)
     parser.add_argument("--thresholds", nargs="+", default=None)
@@ -361,6 +393,8 @@ def main():
     parser.add_argument("--experimental_pdb_dir", type=Path, default=DEFAULT_EXPERIMENTAL_PDB_DIR)
     parser.add_argument("--alphafold_pdb_dir", type=Path, default=DEFAULT_ALPHAFOLD_PDB_DIR)
     parser.add_argument("--esm_pdb_dir", type=Path, default=DEFAULT_ESM_PDB_DIR)
+    parser.add_argument("--mmcif_dir", type=Path, default=DEFAULT_MMCIF_DIR, help="Raw experimental mmCIF entries, used when no processed or predicted structure exists.")
+    parser.add_argument("--esm_cif_dir", type=Path, default=DEFAULT_ESM_CIF_DIR, help="ESMFold2 CIF files. Structures that exist only here are used too.")
     parser.add_argument("--limit_rows", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--fail_on_unresolved", action="store_true")
@@ -377,7 +411,8 @@ def main():
     for job in jobs:
         for split in ("train", "val", "test"):
             out_path = manifest_path(args.manifests_dir, job, split)
-            if not args.overwrite and prepared_manifest_is_valid(out_path):
+            source_fingerprint = _source_fingerprint(Path(job[f"{split}_path"]), args.limit_rows)
+            if not args.overwrite and prepared_manifest_is_valid(out_path, resolver.index_fingerprint, source_fingerprint):
                 summaries.append({"output_path": str(out_path), "status": "skipped_exists"})
                 continue
             summaries.append(prepare_one_split(Path(job[f"{split}_path"]), out_path, candidates, resolver, args))

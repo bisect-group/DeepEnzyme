@@ -23,8 +23,7 @@ class GCNLayer(nn.Module):
 
     def forward(self, x, adj):
         x = self.linear(x)
-        eye = torch.eye(adj.size(0), device=adj.device, dtype=adj.dtype)
-        adj = normalize_adj(adj + eye)
+        adj = normalize_adj(adj + torch.eye(adj.size(0), device=adj.device))
         return torch.mm(adj.to(torch.float32), x.to(torch.float32))
 
 
@@ -104,7 +103,7 @@ class DeepEnzymeBench(nn.Module):
     def protein_gcn(self, adjacency, words, dropout):
         if hasattr(adjacency, "toarray"):
             adjacency = adjacency.toarray()
-        adjacency = torch.as_tensor(adjacency, dtype=torch.float32, device=words.device)
+        adjacency = torch.as_tensor(adjacency, device=words.device)
         word_vectors = self.embed_wordGCN(words)
         return self.gcn(word_vectors, adjacency)
 

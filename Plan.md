@@ -12,7 +12,6 @@ Create a bench-owned EMULaToR workflow for DeepEnzyme that retrains on explicit 
 - Use a bench-local DeepEnzyme-equivalent model implementation that removes hardcoded `.cuda()` calls.
 - Keep original default settings: `lr=0.001`, `iteration=200`, `dropout=0.3`, `dim=64`, `layer_output=3`, `hidden_dim1=64`, `hidden_dim2=64`, `nhead=4`, `hid_size=64`, `layers_trans=3`.
 - Save resumable checkpoints with model, optimizer, scheduler, AMP scaler, RNG state, metric history, and best validation checkpoint.
-- Include Optuna as an optional secondary path for learning rate, weight decay, and dropout only.
 
 ## Test Plan
 
@@ -20,7 +19,6 @@ Create a bench-owned EMULaToR workflow for DeepEnzyme that retrains on explicit 
 - Run a tiny CUDA 2 smoke through prepare, cache, train, and metrics export.
 - Re-run the smoke without overwrite flags to verify cache reuse and completed-run skipping.
 - Verify `last_checkpoint.pt`, `best_checkpoint.pt`, final metrics, and prediction CSVs are written.
-- Run a one-trial Optuna smoke after the original-settings path passes.
 
 ## Assumptions
 

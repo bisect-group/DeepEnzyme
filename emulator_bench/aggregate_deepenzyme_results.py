@@ -2,32 +2,27 @@
 Aggregate DeepEnzyme EMULaToR results across seeds.
 
 Walks DeepEnzyme result directories, reads final_results_{train,val,test}.csv
-for every complete seed run, and writes mean + variance per metric per TVT
+for every complete seed run, and writes mean + std per metric per TVT
 split.
 
 Directory layouts handled:
   <results_dir>/<split_group>/threshold_X/seed_N
   <results_dir>/<split_group>/<split_group>/seed_N
-
-Default input:
-  ~/github/EMULaToR/data/processed/baselines/DeepEnzyme/deepenzyme_results_original
-
-Default output:
-  ~/github/EMULaToR/data/processed/baselines/DeepEnzyme/aggregate_deepenzyme_results.csv
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-EMULATOR_ROOT = Path("~/github/EMULaToR/data/processed/baselines").expanduser()
-DEEPENZYME_ROOT = EMULATOR_ROOT / "DeepEnzyme"
-DEFAULT_RESULTS_DIR = DEEPENZYME_ROOT / "deepenzyme_results_original"
-DEFAULT_OUTPUT = DEEPENZYME_ROOT / "aggregate_deepenzyme_results.csv"
+from emulator_bench.common import DEFAULT_WORK_DIR
+
+
 SPLITS = ("train", "val", "test")
 METRIC_ALIASES = {
     "mae": "MAE",
@@ -108,7 +103,7 @@ def aggregate(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     metrics = list(METRIC_ALIASES)
     group_keys = ["split_group", "threshold", "split_name", "tvt_split"]
-    agg = df.groupby(group_keys, dropna=False)[metrics].agg(["mean", "var"])
+    agg = df.groupby(group_keys, dropna=False)[metrics].agg(["mean", "std"])
     agg.columns = [f"{metric}_{stat}" for metric, stat in agg.columns]
     agg["n_seeds"] = df.groupby(group_keys, dropna=False).size()
     return agg.reset_index()
@@ -116,15 +111,15 @@ def aggregate(rows: list[dict]) -> pd.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--results_dir", type=Path, default=DEFAULT_RESULTS_DIR)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--results_dir", type=Path, default=DEFAULT_WORK_DIR / "results", help="<work_dir>/results written by run_split_benchmarks.py.")
+    parser.add_argument("--output", type=Path, default=None, help="Default: <results_dir>/aggregate_deepenzyme_results.csv.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     results_dir = args.results_dir.expanduser().resolve()
-    output = args.output.expanduser().resolve()
+    output = (args.output or results_dir / "aggregate_deepenzyme_results.csv").expanduser().resolve()
 
     if not results_dir.exists():
         raise FileNotFoundError(f"Results directory does not exist: {results_dir}")

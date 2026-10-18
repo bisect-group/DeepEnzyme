@@ -17,20 +17,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-DEFAULT_MODEL_NAME = "DeepEnzyme"
-DEFAULT_BASE_DIR = Path("/home/adhil/github/EMULaToR/data/processed/baselines/DeepEnzyme")
-DEFAULT_MANIFESTS_DIR = DEFAULT_BASE_DIR / "deepenzyme_manifests"
-DEFAULT_FEATURES_DIR = DEFAULT_BASE_DIR / "deepenzyme_features"
-DEFAULT_CACHE_DIR = DEFAULT_BASE_DIR / "embeddings"
-DEFAULT_RESULTS_DIR = DEFAULT_BASE_DIR / "deepenzyme_results_original"
+EMULATOR_ROOT = REPO_ROOT.parents[1]
+DEFAULT_BASE_DIR = EMULATOR_ROOT / "data/processed/datasets/kinetic_dataset/kcat"
+DEFAULT_WORK_DIR = EMULATOR_ROOT / "outputs/baselines/DeepEnzyme"
+DEFAULT_SEEDS = [666, 777, 888]
 DEFAULT_SPLIT_GROUPS = [
     "random_splits_grouped_sequence",
     "random_splits_grouped_smiles",
-    "enzyme_sequence_splits",
-    "enzyme_structure_splits",
-    "substrate_splits",
-    "conformer_cosine_splits",
     "uniprot_time_splits",
+    "enzyme_sequence_splits",
+    "substrate_splits",
 ]
 KEY_COLUMNS = ["smiles", "sequence", "value", "smiles_hash", "uniprot_date", "log10_value"]
 

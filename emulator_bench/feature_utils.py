@@ -2,7 +2,6 @@ import hashlib
 import json
 import os
 import pickle
-import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -12,7 +11,7 @@ import scipy.sparse as sparse
 from rdkit import Chem
 from sklearn.metrics import pairwise_distances
 
-CACHE_VERSION = "v2"
+CACHE_VERSION = "v3"
 
 
 def load_pickle(file_name):
@@ -28,13 +27,6 @@ def _ensure_dir(path):
 
 def _sha256_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _canonical_smiles(smiles):
-    mol = Chem.MolFromSmiles(str(smiles))
-    if mol is None:
-        raise ValueError(f"Invalid SMILES: {smiles}")
-    return Chem.MolToSmiles(mol, canonical=True)
 
 
 def _file_signature(path):
@@ -62,7 +54,7 @@ def create_atoms(mol, atom_dict):
     for a in mol.GetAromaticAtoms():
         idx = a.GetIdx()
         atoms[idx] = (atoms[idx], "aromatic")
-    atoms = [atom_dict.get(a, 0) for a in atoms]
+    atoms = [atom_dict[a] for a in atoms]
     return np.array(atoms, dtype=np.int64)
 
 
@@ -70,13 +62,18 @@ def create_ijbonddict(mol, bond_dict):
     i_jbond_dict = defaultdict(lambda: [])
     for b in mol.GetBonds():
         i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
-        bond = bond_dict.get(str(b.GetBondType()), 0)
+        bond = bond_dict[str(b.GetBondType())]
         i_jbond_dict[i].append((j, bond))
         i_jbond_dict[j].append((i, bond))
     return i_jbond_dict
 
 
 def extract_fingerprints(atoms, i_jbond_dict, radius, fingerprint_dict, edge_dict):
+    """Copy of the original WL step. It only emits atoms that have a bond, in bond-dict order.
+
+    Atoms without a bond (disconnected molecules) are not emitted, so the result can be shorter than the
+    atom count. Unknown atoms or bonds raise KeyError and short lists raise IndexError, as in the original.
+    """
     if (len(atoms) == 1) or (radius == 0):
         fingerprints = [fingerprint_dict[a] for a in atoms]
     else:
@@ -84,25 +81,18 @@ def extract_fingerprints(atoms, i_jbond_dict, radius, fingerprint_dict, edge_dic
         i_jedge_dict = i_jbond_dict
 
         for _ in range(radius):
-            fingerprints = [0 for _ in range(len(nodes))]
+            fingerprints = []
             for i, j_edge in i_jedge_dict.items():
-                if i >= len(nodes):
-                    continue
                 neighbors = [(nodes[j], edge) for j, edge in j_edge]
                 fingerprint = (nodes[i], tuple(sorted(neighbors)))
-                fingerprints[i] = fingerprint_dict.get(fingerprint, 0)
+                fingerprints.append(fingerprint_dict.get(fingerprint, 0))
             nodes = fingerprints
 
             _i_jedge_dict = defaultdict(lambda: [])
             for i, j_edge in i_jedge_dict.items():
-                if i >= len(nodes):
-                    continue
                 for j, edge in j_edge:
-                    if j >= len(nodes):
-                        continue
                     both_side = tuple(sorted((nodes[i], nodes[j])))
-                    edge = edge_dict.get((both_side, edge), 0)
-                    _i_jedge_dict[i].append((j, edge))
+                    _i_jedge_dict[i].append((j, edge_dict.get((both_side, edge), 0)))
             i_jedge_dict = _i_jedge_dict
 
     return np.array(fingerprints, dtype=np.int64)
@@ -113,7 +103,46 @@ def create_adjacency(mol):
     return np.array(adjacency, dtype=np.float32)
 
 
+def _get_ca_coords_cif(cif_path, chain_id):
+    """Stream the _atom_site loop of an mmCIF file and return the C-alpha atoms of the first model."""
+    columns, header, rows = [], False, []
+    with open(cif_path) as handle:
+        for line in handle:
+            if line.startswith("loop_"):
+                if rows:
+                    break
+                columns, header = [], True
+            elif header and line.startswith("_"):
+                columns.append(line.split()[0])
+            elif header:
+                header = False
+                if not (columns and columns[0].startswith("_atom_site.")):
+                    columns = []
+            if columns and not header and not line.startswith(("_", "loop_", "#")):
+                rows.append(line.split())
+    if not rows:
+        return pd.DataFrame(columns=["res_num", "res_name", "x", "y", "z"])
+    names = {name.split(".", 1)[1]: idx for idx, name in enumerate(columns)}
+    chain_col = names.get("auth_asym_id", names["label_asym_id"])
+    seq_col = names.get("auth_seq_id", names["label_seq_id"])
+    atom_col = names.get("auth_atom_id", names["label_atom_id"])
+    comp_col = names.get("auth_comp_id", names["label_comp_id"])
+    first_model = rows[0][names["pdbx_PDB_model_num"]] if "pdbx_PDB_model_num" in names else None
+    out = [
+        [row[seq_col], row[comp_col], row[names["Cartn_x"]], row[names["Cartn_y"]], row[names["Cartn_z"]]]
+        for row in rows
+        if row[names["group_PDB"]] == "ATOM"
+        and row[atom_col] == "CA"
+        and (chain_id is None or row[chain_col] == chain_id)
+        and (first_model is None or row[names["pdbx_PDB_model_num"]] == first_model)
+        and row[names.get("label_alt_id", atom_col)] in {".", "A", "CA"}
+    ]
+    return pd.DataFrame(out, columns=["res_num", "res_name", "x", "y", "z"])
+
+
 def get_ca_coords(pdb_path, chain_id="A"):
+    if str(pdb_path).endswith(".cif"):
+        return _get_ca_coords_cif(pdb_path, chain_id)
     with open(pdb_path, "r") as file:
         lines = file.readlines()
 
@@ -172,25 +201,18 @@ def protein_contact_map(pdb_path, seq, dist_thres=10.0, chain_id="A"):
         raise ValueError(f"No C-alpha atoms found in PDB: {pdb_path}")
 
     xyz = ca_coords[["x", "y", "z"]].astype(float).values
-    dist_arr = pairwise_distances(xyz)
-    cont_arr = (dist_arr < dist_thres).astype(np.int32)
+    cont_arr = (pairwise_distances(xyz) < dist_thres).astype(np.int32)
 
-    target_len = len(seq)
-    if cont_arr.shape[0] == target_len:
-        proteinadjacency = sparse.csr_matrix(cont_arr)
-    else:
-        if cont_arr.shape[0] > target_len:
-            cont_arr = cont_arr[:target_len, :target_len]
-        else:
-            a = np.zeros((cont_arr.shape[0], target_len - cont_arr.shape[0]), dtype=np.int32)
-            cont_arr = np.column_stack((cont_arr, a))
-            b = np.zeros((target_len - cont_arr.shape[0], target_len), dtype=np.int32)
-            cont_arr = np.row_stack((cont_arr, b))
-        row, col = np.diag_indices_from(cont_arr)
-        cont_arr[row, col] = 1
-        proteinadjacency = sparse.csr_matrix(cont_arr)
-
-    return proteinadjacency
+    n, target_len = cont_arr.shape[0], len(seq)
+    if n == target_len:
+        return sparse.csr_matrix(cont_arr)
+    if n > target_len:
+        raise ValueError(f"{n} C-alpha atoms for {target_len} residues: {pdb_path}")
+    # Zero-padded float64 map with a unit diagonal. The original builds and normalises it in float64.
+    padded = np.zeros((target_len, target_len), dtype=np.float64)
+    padded[:n, :n] = cont_arr
+    np.fill_diagonal(padded, 1)
+    return sparse.csr_matrix(padded)
 
 
 class FeatureCache:
@@ -208,8 +230,7 @@ class FeatureCache:
         return _sha256_text(payload)
 
     def smiles_key(self, smiles, radius):
-        can = _canonical_smiles(smiles)
-        payload = f"{CACHE_VERSION}|smiles|radius={radius}|{can}"
+        payload = f"{CACHE_VERSION}|smiles|radius={radius}|{smiles}"
         return _sha256_text(payload)
 
     def struct_key(self, structure_path, sequence, dist_thres, chain_id):

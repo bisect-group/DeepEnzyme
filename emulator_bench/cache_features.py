@@ -7,32 +7,30 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import (
-    DEFAULT_BASE_DIR,
-    DEFAULT_CACHE_DIR,
-    DEFAULT_FEATURES_DIR,
-    DEFAULT_MANIFESTS_DIR,
     DEFAULT_SPLIT_GROUPS,
     atomic_json,
     discover_split_jobs,
     feature_dir,
+    load_json,
     manifest_path,
     normalize_threshold_args,
     read_table,
     require_columns,
 )
 from emulator_bench.feature_utils import (
+    CACHE_VERSION,
     FeatureCache,
     atomic_save_object_array,
     create_adjacency,
@@ -57,23 +55,34 @@ REQUIRED_FEATURE_FILES = [
 REQUIRED_MANIFEST_COLUMNS = {"sequence", "smiles", "structure_path", "chain_id", "target"}
 
 
-def _feature_complete(out_dir: Path) -> bool:
-    return all((out_dir / name).exists() for name in REQUIRED_FEATURE_FILES)
+LABEL = "log2_value"
 
 
-def _label_for(row: dict, target_col: str, target_transform: str) -> float:
-    if target_transform == "none":
-        return float(row[target_col])
-    if target_transform == "log2_from_value":
-        value = float(row["value"])
-        if value <= 0:
-            raise ValueError(f"value must be positive for log2 transform, got {value}")
-        return float(np.log2(value))
-    raise ValueError(f"Unsupported target_transform: {target_transform}")
+def _signature(manifest: Path, limit_rows) -> str:
+    stat = manifest.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}:{limit_rows}"
+
+
+def _feature_complete(out_dir: Path, manifest: Path, limit_rows) -> bool:
+    """Complete features exist for this manifest and hold the log2(kcat) label of the original code."""
+    summary = load_json(out_dir / "feature_summary.json", {})
+    return (
+        all((out_dir / name).exists() for name in REQUIRED_FEATURE_FILES)
+        and summary.get("label") == LABEL
+        and summary.get("cache_version") == CACHE_VERSION
+        and summary.get("manifest_signature") == _signature(manifest, limit_rows)
+    )
+
+
+def _label_for(row: dict) -> float:
+    value = float(row["value"])
+    if value <= 0:
+        raise ValueError(f"value must be positive for the log2 label, got {value}")
+    return float(np.log2(value))
 
 
 def build_feature_split(manifest: Path, out_dir: Path, args, dictionaries: dict) -> dict:
-    if _feature_complete(out_dir) and not args.overwrite:
+    if _feature_complete(out_dir, manifest, args.limit_rows) and not args.overwrite:
         return {"manifest": str(manifest), "out_dir": str(out_dir), "status": "skipped_exists"}
 
     frame = read_table(manifest)
@@ -83,10 +92,7 @@ def build_feature_split(manifest: Path, out_dir: Path, args, dictionaries: dict)
             f"Prepared manifest has old or invalid schema; missing {missing} in {manifest}. "
             "Run emulator_bench/prepare_splits.py first, or rerun run_split_benchmarks.py after this fix."
         )
-    required = ["sequence", "smiles", "structure_path", "chain_id", args.target_col]
-    if args.target_transform == "log2_from_value":
-        required.append("value")
-    require_columns(frame, required, manifest)
+    require_columns(frame, ["sequence", "smiles", "structure_path", "chain_id", "value"], manifest)
     if args.limit_rows:
         frame = frame.head(args.limit_rows).copy()
 
@@ -129,6 +135,8 @@ def build_feature_split(manifest: Path, out_dir: Path, args, dictionaries: dict)
                     dictionaries["edge_dict"],
                 )
                 smiles_adj = create_adjacency(mol)
+                if len(fp_ids) != len(smiles_adj):
+                    raise ValueError(f"Fingerprint length {len(fp_ids)} != atom count {len(smiles_adj)}: {smiles}")
                 cache.save_smiles(smiles_key, fp_ids, smiles_adj)
                 stats["smiles_writes"] += 1
             else:
@@ -147,7 +155,7 @@ def build_feature_split(manifest: Path, out_dir: Path, args, dictionaries: dict)
             smileadjacencies.append(np.asarray(smiles_adj, dtype=np.float32))
             sequences.append(np.asarray(seq_ids, dtype=np.int64))
             proteinadjacencies.append(prot_adj)
-            labels.append(np.asarray([_label_for(row, args.target_col, args.target_transform)], dtype=np.float32))
+            labels.append(np.asarray([_label_for(row)], dtype=np.float32))
             kept_rows.append(idx)
         except Exception as exc:
             failed_rows.append({"row_index": idx, "sample_id": row.get("sample_id", ""), "error": str(exc)})
@@ -173,8 +181,9 @@ def build_feature_split(manifest: Path, out_dir: Path, args, dictionaries: dict)
         "rows_in": int(len(frame)),
         "rows_out": int(len(kept_rows)),
         "rows_failed": int(len(failed_rows)),
-        "target_col": args.target_col,
-        "target_transform": args.target_transform,
+        "label": LABEL,
+        "cache_version": CACHE_VERSION,
+        "manifest_signature": _signature(manifest, args.limit_rows),
         "radius": int(args.radius),
         "ngram": int(args.ngram),
         "dist_thres": float(args.dist_thres),
@@ -196,16 +205,14 @@ def load_dictionaries(dict_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Cache DeepEnzyme static features for prepared EMULaToR manifests.")
-    parser.add_argument("--base_dir", type=Path, default=DEFAULT_BASE_DIR)
-    parser.add_argument("--manifests_dir", type=Path, default=DEFAULT_MANIFESTS_DIR)
-    parser.add_argument("--features_dir", type=Path, default=DEFAULT_FEATURES_DIR)
-    parser.add_argument("--cache_dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--base_dir", type=Path, required=True)
+    parser.add_argument("--manifests_dir", type=Path, required=True)
+    parser.add_argument("--features_dir", type=Path, required=True)
+    parser.add_argument("--cache_dir", type=Path, required=True)
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
     parser.add_argument("--threshold", type=str, default=None)
     parser.add_argument("--thresholds", nargs="+", default=None)
-    parser.add_argument("--dict_dir", type=Path, default=Path("Data/Input"))
-    parser.add_argument("--target_col", type=str, default="target")
-    parser.add_argument("--target_transform", choices=["none", "log2_from_value"], default="none")
+    parser.add_argument("--dict_dir", type=Path, default=REPO_ROOT / "Data/Input")
     parser.add_argument("--radius", type=int, default=2)
     parser.add_argument("--ngram", type=int, default=4)
     parser.add_argument("--dist_thres", type=float, default=10.0)

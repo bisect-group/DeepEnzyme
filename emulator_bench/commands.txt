@@ -1,98 +1,27 @@
-# DeepEnzyme EMULaToR bench commands
+# DeepEnzyme emulator_bench commands (kcat only)
+# Run from the DeepEnzyme submodule root: EMULaToR/baselines/DeepEnzyme
+# PY=/home/adhil/.conda/envs/mldb/bin/python
 
-Run from the repo root:
+# Defaults: --base_dir EMULaToR/data/processed/datasets/kinetic_dataset/kcat,
+#           --work_dir EMULaToR/outputs/baselines/DeepEnzyme.
+DATA=../../data/processed/datasets/kinetic_dataset/kcat
+WORK=../../outputs/baselines/DeepEnzyme
 
-```bash
-cd /home/adhil/github/DeepEnzyme
-```
+# Prepare structures, cache features and train every default split for three seeds.
+# Split groups: random_splits_grouped_sequence, random_splits_grouped_smiles, uniprot_time_splits,
+# enzyme_sequence_splits/threshold_*, substrate_splits/threshold_* (thresholds are found on disk).
+CUDA_VISIBLE_DEVICES=0 $PY emulator_bench/run_split_benchmarks.py \
+  --base_dir $DATA --work_dir $WORK --seeds 666 777 888
 
-## Smoke test on CUDA 2
+# Run jobs in parallel on several GPUs.
+$PY emulator_bench/run_split_benchmarks.py \
+  --base_dir $DATA --work_dir $WORK --seeds 666 777 888 \
+  --gpus 0 1 --runs_per_gpu 2
 
-```bash
-CUDA_VISIBLE_DEVICES=2 conda run -n mldb python emulator_bench/run_split_benchmarks.py \
-  --split_groups random_splits_grouped_sequence \
-  --limit_rows 6 \
-  --iteration 1 \
-  --seeds 666 \
-  --overwrite_prepare \
-  --overwrite_features \
-  --overwrite_runs
-```
+# Smoke test: one split, one seed, 100 rows per split, one epoch.
+CUDA_VISIBLE_DEVICES=1 $PY emulator_bench/run_split_benchmarks.py \
+  --base_dir $DATA --work_dir <scratch_dir> --split_groups random_splits_grouped_sequence \
+  --seeds 666 --limit_rows 100 --iteration 1
 
-Run the same command again without overwrite flags to verify cache reuse and completed-run skipping:
-
-```bash
-CUDA_VISIBLE_DEVICES=2 conda run -n mldb python emulator_bench/run_split_benchmarks.py \
-  --split_groups random_splits_grouped_sequence \
-  --limit_rows 6 \
-  --iteration 1 \
-  --seeds 666
-```
-
-## Full original-settings retraining on CUDA 2
-
-```bash
-conda run -n mldb python emulator_bench/run_split_benchmarks.py \
-  --gpus 2 \
-  --seeds 666 777 888 \
-  --runs_per_gpu 6 \
-  --cpu_threads_per_run 4 \
-  --cpu_interop_threads_per_run 4
-```
-
-Run multiple independent split/seed jobs concurrently on CUDA 2:
-
-```bash
-conda run -n mldb python emulator_bench/run_split_benchmarks.py \
-  --gpus 2 \
-  --runs_per_gpu 2 \
-  --cpu_threads_per_run 1 \
-  --seeds 666 777 888
-```
-
-Run across multiple GPUs, with two concurrent jobs per GPU:
-
-```bash
-conda run -n mldb python emulator_bench/run_split_benchmarks.py \
-  --gpus 0 1 2 3 \
-  --runs_per_gpu 2 \
-  --cpu_threads_per_run 1 \
-  --seeds 666 777 888
-```
-
-## Train on original DeepEnzyme log2(value) target instead of EMULaToR log10_value
-
-```bash
-CUDA_VISIBLE_DEVICES=2 conda run -n mldb python emulator_bench/run_split_benchmarks.py \
-  --split_groups random_splits_grouped_sequence \
-  --target_transform log2_from_value \
-  --seeds 666
-```
-
-## Optional one-trial Optuna smoke
-
-```bash
-CUDA_VISIBLE_DEVICES=2 conda run -n mldb python emulator_bench/tune_optuna.py \
-  --split_groups random_splits_grouped_sequence \
-  --limit_rows 6 \
-  --iteration 1 \
-  --n_trials 1 \
-  --max_jobs 1 \
-  --seeds 666
-```
-
-## Optional retrain from Optuna best hparams
-
-```bash
-CUDA_VISIBLE_DEVICES=2 conda run -n mldb python emulator_bench/launch_parallel_retrain_from_optuna.py \
-  --hparams_json /home/adhil/github/EMULaToR/data/processed/baselines/DeepEnzyme/deepenzyme_optuna_runs/deepenzyme_optuna_best_hparams.json \
-  --gpus 2 \
-  --split_groups random_splits_grouped_sequence \
-  --seeds 666
-```
-
-## Aggregate completed DeepEnzyme results
-
-```bash
-conda run -n mldb python emulator_bench/aggregate_deepenzyme_results.py
-```
+# Aggregate mean and std over seeds.
+$PY emulator_bench/aggregate_deepenzyme_results.py --results_dir $WORK/results

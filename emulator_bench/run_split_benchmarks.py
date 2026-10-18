@@ -15,9 +15,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from emulator_bench.common import (
     DEFAULT_BASE_DIR,
-    DEFAULT_FEATURES_DIR,
-    DEFAULT_MANIFESTS_DIR,
-    DEFAULT_RESULTS_DIR,
+    DEFAULT_WORK_DIR,
+    DEFAULT_SEEDS,
     DEFAULT_SPLIT_GROUPS,
     atomic_csv,
     discover_split_jobs,
@@ -43,34 +42,6 @@ def _apply_cpu_thread_env(env, args):
     env["NUMEXPR_NUM_THREADS"] = threads
     env["VECLIB_MAXIMUM_THREADS"] = threads
     return env
-
-
-def _load_hparams(path: str | None):
-    hparams = {
-        "lr": 0.001,
-        "iteration": 200,
-        "weight_decay": 1e-6,
-        "dropout": 0.3,
-        "dim": 64,
-        "layer_output": 3,
-        "hidden_dim1": 64,
-        "hidden_dim2": 64,
-        "nhead": 4,
-        "hid_size": 64,
-        "layers_trans": 3,
-    }
-    if path:
-        with open(path, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
-        raw = raw.get("best_hparams", raw)
-        for key in list(hparams):
-            if key in raw:
-                hparams[key] = raw[key]
-        if "epochs" in raw:
-            hparams["iteration"] = raw["epochs"]
-        if "drop_rate" in raw:
-            hparams["dropout"] = raw["drop_rate"]
-    return hparams
 
 
 def maybe_prepare(args):
@@ -115,10 +86,6 @@ def maybe_cache(args):
         str(args.cache_dir),
         "--dict_dir",
         str(args.dict_dir),
-        "--target_col",
-        "target",
-        "--target_transform",
-        args.target_transform,
         "--split_groups",
         *args.split_groups,
     ]
@@ -131,7 +98,7 @@ def maybe_cache(args):
     _run(cmd, dry_run=args.dry_run)
 
 
-def train_command(args, job, seed, hparams):
+def train_command(args, job, seed):
     train_dir = feature_dir(args.features_dir, job, "train")
     val_dir = feature_dir(args.features_dir, job, "val")
     test_dir = feature_dir(args.features_dir, job, "test")
@@ -154,10 +121,10 @@ def train_command(args, job, seed, hparams):
         "--seed",
         str(seed),
     ]
-    for key, value in hparams.items():
-        cmd.extend([f"--{key}", str(value)])
-    if args.no_amp:
-        cmd.append("--no_amp")
+    if args.iteration is not None:
+        cmd.extend(["--iteration", str(args.iteration)])
+    if args.amp:
+        cmd.append("--amp")
     if args.overwrite_runs:
         cmd.append("--overwrite")
     if args.hide_sample_progress:
@@ -176,11 +143,11 @@ def _gpu_list(args):
     return [item.strip() for item in str(args.cuda_visible_devices).split(",") if item.strip()]
 
 
-def run_training_tasks(args, jobs, hparams):
+def run_training_tasks(args, jobs):
     tasks = []
     for job in jobs:
         for seed in args.seeds:
-            cmd, out_dir = train_command(args, job, seed, hparams)
+            cmd, out_dir = train_command(args, job, seed)
             complete_marker = out_dir / "completed.json"
             if complete_marker.exists() and not args.overwrite_runs:
                 print(f"[skip completed] {out_dir}")
@@ -279,42 +246,37 @@ def summarize(results_dir: Path):
     atomic_csv(Path(results_dir) / "deepenzyme_summary_runs.csv", runs)
     metric_cols = [c for c in runs.columns if c.startswith("test_")]
     if metric_cols:
-        grouped = runs.groupby(["split_group", "split_name"], as_index=False)[metric_cols].agg(["mean", "var"])
+        grouped = runs.groupby(["split_group", "split_name"], as_index=False)[metric_cols].agg(["mean", "std"])
         grouped.columns = ["_".join([part for part in col if part]) for col in grouped.columns.to_flat_index()]
         atomic_csv(Path(results_dir) / "deepenzyme_summary_thresholds.csv", grouped.reset_index(drop=True))
     return runs
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run original-settings DeepEnzyme retraining across EMULaToR split jobs.")
-    parser.add_argument("--base_dir", type=Path, default=DEFAULT_BASE_DIR)
-    parser.add_argument("--manifests_dir", type=Path, default=DEFAULT_MANIFESTS_DIR)
-    parser.add_argument("--features_dir", type=Path, default=DEFAULT_FEATURES_DIR)
-    parser.add_argument("--cache_dir", type=Path, default=DEFAULT_BASE_DIR / "embeddings")
-    parser.add_argument("--results_dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    parser = argparse.ArgumentParser(description="Run original-settings DeepEnzyme training across EMULaToR split jobs.")
+    parser.add_argument("--base_dir", type=Path, default=DEFAULT_BASE_DIR, help="Task directory, e.g. data/processed/datasets/kinetic_dataset/kcat.")
+    parser.add_argument("--work_dir", type=Path, default=DEFAULT_WORK_DIR, help="Output root for manifests, features, caches and results.")
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
     parser.add_argument("--threshold", type=str, default=None)
     parser.add_argument("--thresholds", nargs="+", default=None)
-    parser.add_argument("--dict_dir", type=Path, default=Path("Data/Input"))
+    parser.add_argument("--dict_dir", type=Path, default=REPO_ROOT / "Data/Input")
     parser.add_argument("--source_target_col", type=str, default="log10_value")
-    parser.add_argument("--target_transform", choices=["none", "log2_from_value"], default="none")
     parser.add_argument("--identity_threshold", type=float, default=90.0)
-    parser.add_argument("--seeds", nargs="+", type=int, default=[666])
+    parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--cuda_visible_devices", type=str, default="2")
+    parser.add_argument("--cuda_visible_devices", type=str, default="")
     parser.add_argument("--gpus", nargs="+", default=None, help="Physical GPU ids to use for training workers, e.g. --gpus 2 or --gpus 0 1 2.")
     parser.add_argument("--runs_per_gpu", type=int, default=1, help="Concurrent training subprocesses to launch per GPU.")
     parser.add_argument("--cpu_threads_per_run", type=int, default=1, help="CPU BLAS/OpenMP/PyTorch intra-op threads per training subprocess. Use a larger value if CPU is underutilized.")
     parser.add_argument("--cpu_interop_threads_per_run", type=int, default=1, help="PyTorch inter-op CPU threads per training subprocess.")
-    parser.add_argument("--hparams_json", type=str, default=None)
-    parser.add_argument("--iteration", type=int, default=None, help="Override original 200 epochs, mainly for smoke tests.")
+    parser.add_argument("--iteration", type=int, default=None, help="Smoke-test override of the original 200 epochs.")
     parser.add_argument("--limit_rows", type=int, default=None, help="Limit rows per split for smoke tests.")
     parser.add_argument("--skip_prepare", action="store_true")
     parser.add_argument("--skip_cache", action="store_true")
     parser.add_argument("--overwrite_prepare", action="store_true")
     parser.add_argument("--overwrite_features", action="store_true")
     parser.add_argument("--overwrite_runs", action="store_true")
-    parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--amp", action="store_true", help="Opt in to mixed precision. The original code trains in fp32.")
     parser.add_argument("--hide_sample_progress", action="store_true", help="Hide train/val/test sample progress bars in training subprocesses.")
     parser.add_argument("--progress_interval", type=int, default=1000, help="Sample interval for live RMSE progress updates.")
     parser.add_argument("--keep_going", action="store_true", help="Continue other parallel jobs if one training subprocess fails.")
@@ -322,9 +284,11 @@ def main():
     args = parser.parse_args()
 
     args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
-    hparams = _load_hparams(args.hparams_json)
-    if args.iteration is not None:
-        hparams["iteration"] = args.iteration
+    args.base_dir, args.work_dir, args.dict_dir = (Path(os.path.abspath(path)) for path in (args.base_dir, args.work_dir, args.dict_dir))
+    args.manifests_dir = args.work_dir / "manifests"
+    args.features_dir = args.work_dir / "features"
+    args.cache_dir = args.work_dir / "embeddings"
+    args.results_dir = args.work_dir / "results"
 
     if args.runs_per_gpu < 1:
         raise ValueError("--runs_per_gpu must be >= 1")
@@ -346,7 +310,7 @@ def main():
     if not jobs:
         raise FileNotFoundError(f"No split jobs found in {args.base_dir}")
 
-    run_training_tasks(args, jobs, hparams)
+    run_training_tasks(args, jobs)
     if not args.dry_run:
         summarize(args.results_dir)
 
