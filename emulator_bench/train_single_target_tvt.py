@@ -51,9 +51,18 @@ def load_split_dataset(split_dir: Path, device):
     return list(zip(fingerprint, smileadjacencies, sequences, proteinadjacencies, labels))
 
 
-def rows_dropped(split_dir: Path) -> int:
-    """Rows that the original featurizer cannot build. cache_features.py drops them and counts them."""
-    return int(json.loads((Path(split_dir) / "feature_summary.json").read_text())["rows_failed"])
+def shuffled_once(dataset, seed):
+    """The original shuffles the data once (np.random.seed, np.random.shuffle) and trains in that order in every epoch."""
+    return [dataset[i] for i in np.random.RandomState(seed).permutation(len(dataset))]
+
+
+def label_array(dataset):
+    """Labels of a dataset as one float64 array, read from the device once."""
+    return torch.cat([data[-1] for data in dataset]).cpu().double().numpy()
+
+
+def feature_summary(split_dir: Path) -> dict:
+    return json.loads((Path(split_dir) / "feature_summary.json").read_text())
 
 
 def build_model(args, dict_dir: Path, device):
@@ -74,19 +83,39 @@ def build_model(args, dict_dir: Path, device):
     return model, len(fingerprint_dict), len(word_dict)
 
 
+def configure_precision(args, device):
+    """Autocast dtype, precision name and GradScaler of a run. The default is fp32 without TF32, as the original code."""
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    if args.fp16:
+        amp_dtype, mode = torch.float16, "fp16"
+    else:
+        amp_dtype, mode = resolve_amp_dtype(device) if args.amp else (None, "fp32")
+    if args.tf32:
+        mode += "+tf32"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16) if device.type == "cuda" else None
+    return amp_dtype, mode, scaler
+
+
+def make_optimizer(model, args):
+    return optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=args.fused_adamw or None)
+
+
 def _autocast_context(device, amp_dtype):
     return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None)
 
 
-def train_epoch(model, dataset, optimizer, loss_fn, args, device, amp_dtype, scaler):
-    model.train(True)
-    y_true, y_pred = [], []
-    total_loss = 0.0
-    iterator = progress(dataset, desc="train", leave=False, unit="sample", disable=args.hide_sample_progress, dynamic_ncols=True)
-    sse = 0.0
+def run_pass(model, dataset, labels, loss_fn, args, device, amp_dtype, desc, optimizer=None, scaler=None):
+    """One pass over the dataset with one sample per step; it trains when an optimizer is given.
+
+    Loss and predictions stay on the device until the pass ends. Returns metrics, labels and predictions in log10.
+    """
+    iterator = progress(dataset, desc=desc, leave=False, unit="sample", disable=args.hide_sample_progress, dynamic_ncols=True)
+    losses, preds = [], []
+    squared_error = torch.zeros((), device=device)
     for idx, data in enumerate(iterator, start=1):
-        optimizer.zero_grad(set_to_none=True)
         inputs, label = data[:-1], data[-1]
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
         with _autocast_context(device, amp_dtype):
             output = model(inputs, args.layer_output, args.dropout)
             loss = loss_fn(output.float(), label.float())
@@ -94,46 +123,31 @@ def train_epoch(model, dataset, optimizer, loss_fn, args, device, amp_dtype, sca
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-        else:
+        elif optimizer is not None:
             loss.backward()
             optimizer.step()
-        total_loss += float(loss.detach().cpu())
-        label_value = float(label.detach().cpu().item())
-        pred_value = float(output.detach().float().cpu().item())
-        y_true.append(label_value)
-        y_pred.append(pred_value)
-        sse += (pred_value - label_value) ** 2
+        losses.append(loss.detach())
+        preds.append(output.detach().float().reshape(()))
+        squared_error += (preds[-1] - label.reshape(())) ** 2
         if not args.hide_sample_progress and (idx == 1 or idx % args.progress_interval == 0 or idx == len(dataset)):
-            iterator.set_postfix(rmse=f"{(sse / idx) ** 0.5:.4g}")
-    metrics = metric_dict(np.asarray(y_true) * LOG10_OF_2, np.asarray(y_pred) * LOG10_OF_2)
-    metrics["Loss"] = total_loss / max(1, len(dataset))
-    return metrics
+            iterator.set_postfix(rmse=f"{(squared_error.item() / idx) ** 0.5:.4g}")
+    y_true = labels * LOG10_OF_2
+    y_pred = torch.stack(preds).cpu().double().numpy() * LOG10_OF_2
+    metrics = metric_dict(y_true, y_pred)
+    # A sequential sum of the per-sample float values, like the original loop.
+    metrics["Loss"] = sum(torch.stack(losses).cpu().tolist()) / max(1, len(dataset))
+    return metrics, y_true, y_pred
+
+
+def train_epoch(model, dataset, labels, optimizer, loss_fn, args, device, amp_dtype, scaler):
+    model.train(True)
+    return run_pass(model, dataset, labels, loss_fn, args, device, amp_dtype, "train", optimizer, scaler)[0]
 
 
 @torch.no_grad()
-def evaluate(model, dataset, loss_fn, args, device, amp_dtype, desc):
+def evaluate(model, dataset, labels, loss_fn, args, device, amp_dtype, desc):
     model.train(False)
-    y_true, y_pred = [], []
-    total_loss = 0.0
-    iterator = progress(dataset, desc=desc, leave=False, unit="sample", disable=args.hide_sample_progress, dynamic_ncols=True)
-    sse = 0.0
-    for idx, data in enumerate(iterator, start=1):
-        inputs, label = data[:-1], data[-1]
-        with _autocast_context(device, amp_dtype):
-            output = model(inputs, args.layer_output, args.dropout)
-            loss = loss_fn(output.float(), label.float())
-        total_loss += float(loss.detach().cpu())
-        label_value = float(label.detach().cpu().item())
-        pred_value = float(output.detach().float().cpu().item())
-        y_true.append(label_value)
-        y_pred.append(pred_value)
-        sse += (pred_value - label_value) ** 2
-        if not args.hide_sample_progress and (idx == 1 or idx % args.progress_interval == 0 or idx == len(dataset)):
-            iterator.set_postfix(rmse=f"{(sse / idx) ** 0.5:.4g}")
-    y_true, y_pred = np.asarray(y_true) * LOG10_OF_2, np.asarray(y_pred) * LOG10_OF_2
-    metrics = metric_dict(y_true, y_pred)
-    metrics["Loss"] = total_loss / max(1, len(dataset))
-    return metrics, y_true, y_pred
+    return run_pass(model, dataset, labels, loss_fn, args, device, amp_dtype, desc)
 
 
 def _rng_state():
@@ -182,9 +196,9 @@ def load_checkpoint(path, model, optimizer, scheduler, scaler, device):
     return int(checkpoint["epoch"]), list(checkpoint.get("records", []))
 
 
-def write_final_outputs(model, datasets, loss_fn, args, device, amp_dtype, out_dir: Path):
+def write_final_outputs(model, datasets, labels, loss_fn, args, device, amp_dtype, out_dir: Path):
     for split_name, dataset in datasets.items():
-        metrics, y_true, y_pred = evaluate(model, dataset, loss_fn, args, device, amp_dtype, desc=f"final-{split_name}")
+        metrics, y_true, y_pred = evaluate(model, dataset, labels[split_name], loss_fn, args, device, amp_dtype, desc=f"final-{split_name}")
         atomic_csv(out_dir / f"final_results_{split_name}.csv", pd.DataFrame([metrics]))
         atomic_csv(out_dir / f"pred_label_{split_name}.csv", pd.DataFrame({"pred": y_pred, "label": y_true}))
 
@@ -206,14 +220,13 @@ def main(args):
 
     set_seed(args.seed)
     device = resolve_device(args.device)
-    amp_dtype, precision_mode = resolve_amp_dtype(device) if args.amp else (None, "fp32")
+    amp_dtype, precision_mode, scaler = configure_precision(args, device)
     print(f"Device: {device} | precision: {precision_mode} | CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<not-set>')}")
 
     model, n_fingerprint, n_word = build_model(args, Path(args.dict_dir), device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = make_optimizer(model, args)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.9)
     loss_fn = nn.MSELoss().to(device)
-    scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16)) if device.type == "cuda" else None
 
     print("Loading split feature arrays...")
     datasets = {
@@ -221,6 +234,8 @@ def main(args):
         "val": load_split_dataset(Path(args.val_dir), device),
         "test": load_split_dataset(Path(args.test_dir), device),
     }
+    datasets["train"] = shuffled_once(datasets["train"], args.seed)
+    labels = {name: label_array(dataset) for name, dataset in datasets.items()}
 
     last_checkpoint = out_dir / "checkpoint_last.pt"
     start_epoch, records = 0, []
@@ -258,13 +273,13 @@ def main(args):
     )
     for epoch in epoch_iter:
         epoch_iter.set_postfix(phase="train")
-        train_metrics = train_epoch(model, datasets["train"], optimizer, loss_fn, args, device, amp_dtype, scaler)
+        train_metrics = train_epoch(model, datasets["train"], labels["train"], optimizer, loss_fn, args, device, amp_dtype, scaler)
         epoch_iter.set_postfix(train_rmse=f"{train_metrics['RMSE']:.4g}")
         epoch_iter.set_postfix(phase="val")
-        val_metrics, _val_y, _val_pred = evaluate(model, datasets["val"], loss_fn, args, device, amp_dtype, desc="val")
+        val_metrics, _val_y, _val_pred = evaluate(model, datasets["val"], labels["val"], loss_fn, args, device, amp_dtype, desc="val")
         epoch_iter.set_postfix(val_rmse=f"{val_metrics['RMSE']:.4g}")
         epoch_iter.set_postfix(phase="test")
-        test_metrics, _test_y, _test_pred = evaluate(model, datasets["test"], loss_fn, args, device, amp_dtype, desc="test")
+        test_metrics, _test_y, _test_pred = evaluate(model, datasets["test"], labels["test"], loss_fn, args, device, amp_dtype, desc="test")
 
         if epoch // 10 > 0 and epoch % 10 > 0:
             scheduler.step()
@@ -295,7 +310,8 @@ def main(args):
         if args.log_json:
             write(json.dumps(row))
 
-    write_final_outputs(model, datasets, loss_fn, args, device, amp_dtype, out_dir)
+    write_final_outputs(model, datasets, labels, loss_fn, args, device, amp_dtype, out_dir)
+    summaries = {name: feature_summary(getattr(args, f"{name}_dir")) for name in datasets}
     atomic_json(
         out_dir / "run_summary.json",
         {
@@ -305,7 +321,9 @@ def main(args):
             "test_size": len(datasets["test"]),
             "final_epoch": int(args.iteration),
             "final_val_rmse": float(records[-1]["RMSE_val"]),
-            "rows_dropped": {name: rows_dropped(getattr(args, f"{name}_dir")) for name in datasets},
+            "rows_dropped": {name: summaries[name]["rows_failed"] for name in datasets},
+            "failed_by_stage": {name: summaries[name]["failed_by_stage"] for name in datasets},
+            "structure": {name: summaries[name]["structure"] for name in datasets},
             "precision": precision_mode,
             "n_fingerprint": int(n_fingerprint),
             "n_word": int(n_word),
@@ -324,6 +342,9 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu", type=str)
     parser.add_argument("--seed", default=666, type=int)
     parser.add_argument("--amp", action="store_true", help="Opt in to mixed precision. The original code trains in fp32.")
+    parser.add_argument("--fp16", action="store_true", help="fp16 autocast with GradScaler. It replaces the bf16 of --amp.")
+    parser.add_argument("--tf32", action="store_true", help="TF32 matrix multiplications in fp32 code.")
+    parser.add_argument("--fused_adamw", action="store_true", help="Fused AdamW kernel (CUDA only).")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--log_json", action="store_true", help="Print one JSON metrics row per epoch to stdout.")
     parser.add_argument("--show_sample_progress", action="store_true", help="Deprecated compatibility flag; sample progress is shown by default.")

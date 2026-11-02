@@ -6,12 +6,13 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import scipy.sparse as sparse
+from Bio.Align import PairwiseAligner
+from Bio.SeqUtils import seq1
 from rdkit import Chem
 from sklearn.metrics import pairwise_distances
 
-CACHE_VERSION = "v3"
+CACHE_VERSION = "v6"
 
 
 def load_pickle(file_name):
@@ -49,12 +50,17 @@ def split_sequence(sequence, ngram, word_dict):
     return np.array(words, dtype=np.int64)
 
 
+def unknown_id(table):
+    """Id of an atom or bond type that is not in the dictionary. It is not added to the dictionary."""
+    return len(table)
+
+
 def create_atoms(mol, atom_dict):
     atoms = [a.GetSymbol() for a in mol.GetAtoms()]
     for a in mol.GetAromaticAtoms():
         idx = a.GetIdx()
         atoms[idx] = (atoms[idx], "aromatic")
-    atoms = [atom_dict[a] for a in atoms]
+    atoms = [atom_dict.get(a, unknown_id(atom_dict)) for a in atoms]
     return np.array(atoms, dtype=np.int64)
 
 
@@ -62,20 +68,23 @@ def create_ijbonddict(mol, bond_dict):
     i_jbond_dict = defaultdict(lambda: [])
     for b in mol.GetBonds():
         i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
-        bond = bond_dict[str(b.GetBondType())]
+        bond = bond_dict.get(str(b.GetBondType()), unknown_id(bond_dict))
         i_jbond_dict[i].append((j, bond))
         i_jbond_dict[j].append((i, bond))
+    if len(i_jbond_dict) < mol.GetNumAtoms():
+        # Atoms without a bond get an empty entry, and all entries follow the atom index.
+        i_jbond_dict = {i: i_jbond_dict.get(i, []) for i in range(mol.GetNumAtoms())}
     return i_jbond_dict
 
 
 def extract_fingerprints(atoms, i_jbond_dict, radius, fingerprint_dict, edge_dict):
-    """Copy of the original WL step. It only emits atoms that have a bond, in bond-dict order.
+    """The original WL step, with one fingerprint per atom.
 
-    Atoms without a bond (disconnected molecules) are not emitted, so the result can be shorter than the
-    atom count. Unknown atoms or bonds raise KeyError and short lists raise IndexError, as in the original.
+    Where every atom has a bond, the result equals the original. Unseen single-atom fingerprints map to id 0,
+    like the unseen fingerprints and edges of the original.
     """
     if (len(atoms) == 1) or (radius == 0):
-        fingerprints = [fingerprint_dict[a] for a in atoms]
+        fingerprints = [fingerprint_dict.get(a, 0) for a in atoms]
     else:
         nodes = atoms
         i_jedge_dict = i_jbond_dict
@@ -90,6 +99,7 @@ def extract_fingerprints(atoms, i_jbond_dict, radius, fingerprint_dict, edge_dic
 
             _i_jedge_dict = defaultdict(lambda: [])
             for i, j_edge in i_jedge_dict.items():
+                _i_jedge_dict[i]
                 for j, edge in j_edge:
                     both_side = tuple(sorted((nodes[i], nodes[j])))
                     _i_jedge_dict[i].append((j, edge_dict.get((both_side, edge), 0)))
@@ -103,120 +113,68 @@ def create_adjacency(mol):
     return np.array(adjacency, dtype=np.float32)
 
 
-def _get_ca_coords_cif(cif_path, chain_id):
-    """Stream the _atom_site loop of an mmCIF file and return the C-alpha atoms of the first model."""
-    columns, header, rows = [], False, []
-    with open(cif_path) as handle:
+def chain_residues(pdb_path):
+    """Residue letters and C-alpha coordinates of chain A, read by the fixed columns of the PDB format."""
+    letters, coords = [], []
+    with open(pdb_path) as handle:
         for line in handle:
-            if line.startswith("loop_"):
-                if rows:
-                    break
-                columns, header = [], True
-            elif header and line.startswith("_"):
-                columns.append(line.split()[0])
-            elif header:
-                header = False
-                if not (columns and columns[0].startswith("_atom_site.")):
-                    columns = []
-            if columns and not header and not line.startswith(("_", "loop_", "#")):
-                rows.append(line.split())
-    if not rows:
-        return pd.DataFrame(columns=["res_num", "res_name", "x", "y", "z"])
-    names = {name.split(".", 1)[1]: idx for idx, name in enumerate(columns)}
-    chain_col = names.get("auth_asym_id", names["label_asym_id"])
-    seq_col = names.get("auth_seq_id", names["label_seq_id"])
-    atom_col = names.get("auth_atom_id", names["label_atom_id"])
-    comp_col = names.get("auth_comp_id", names["label_comp_id"])
-    first_model = rows[0][names["pdbx_PDB_model_num"]] if "pdbx_PDB_model_num" in names else None
-    out = [
-        [row[seq_col], row[comp_col], row[names["Cartn_x"]], row[names["Cartn_y"]], row[names["Cartn_z"]]]
-        for row in rows
-        if row[names["group_PDB"]] == "ATOM"
-        and row[atom_col] == "CA"
-        and (chain_id is None or row[chain_col] == chain_id)
-        and (first_model is None or row[names["pdbx_PDB_model_num"]] == first_model)
-        and row[names.get("label_alt_id", atom_col)] in {".", "A", "CA"}
-    ]
-    return pd.DataFrame(out, columns=["res_num", "res_name", "x", "y", "z"])
+            if line.startswith("ATOM") and line[12:16].strip() == "CA" and line[21] == "A":
+                letters.append(seq1(line[17:20], custom_map={"MSE": "M"}, undef_code="X"))
+                coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+    return "".join(letters), np.asarray(coords).reshape(-1, 3)
 
 
-def get_ca_coords(pdb_path, chain_id="A"):
-    if str(pdb_path).endswith(".cif"):
-        return _get_ca_coords_cif(pdb_path, chain_id)
-    with open(pdb_path, "r") as file:
-        lines = file.readlines()
-
-    out = []
-    for line in lines:
-        if not line.startswith("ATOM "):
-            continue
-
-        toks = line.split()
-        # if len(toks) < 9:
-        #     continue
-
-        if len(toks) < 9:
-            continue
-        atom_name = toks[2]
-        current_chain = toks[4]
-        if atom_name != "CA":
-            continue
-        if chain_id is not None and current_chain != chain_id:
-            continue
-
-        res_num = toks[5]
-        res_name = toks[3]
-        x = toks[6]
-        y = toks[7]
-        z = toks[8]
-
-        if len(x) > 8:
-            x = toks[6][:-8]
-            y = toks[6][-8:]
-            z = toks[7]
-        elif len(y) > 8:
-            x = toks[6]
-            y = toks[7][:-8]
-            z = toks[7][-8:]
-        elif len(res_num) > 4:
-            x = toks[5][-8:]
-            y = toks[6]
-            z = toks[7]
-            res_num = toks[5][:-8]
-
-        out.append([res_num, res_name, x, y, z])
-
-    return pd.DataFrame(out, columns=["res_num", "res_name", "x", "y", "z"])
+def _make_aligner():
+    # Global alignment with free end gaps: tags and missing termini cost nothing, inner gaps and mismatches do.
+    aligner = PairwiseAligner(mode="global", match_score=2.0, mismatch_score=-1.0, open_gap_score=-4.0, extend_gap_score=-1.0)
+    aligner.end_insertion_score = aligner.end_deletion_score = 0.0
+    return aligner
 
 
-def protein_contact_map(pdb_path, seq, dist_thres=10.0, chain_id="A"):
-    if chain_id in {"", "None", "none", "null"}:
-        chain_id = None
-    ca_coords = get_ca_coords(pdb_path, chain_id=chain_id)
+ALIGNER = _make_aligner()
 
-    if len(ca_coords) == 0 and chain_id is not None:
-        ca_coords = get_ca_coords(pdb_path, chain_id=None)
 
-    if len(ca_coords) == 0:
-        raise ValueError(f"No C-alpha atoms found in PDB: {pdb_path}")
+def align_chain(chain_seq, seq):
+    """Dataset positions and chain indices of the aligned residue pairs, as two arrays."""
+    if chain_seq == seq:
+        index = np.arange(len(seq))
+        return index, index
+    blocks = ALIGNER.align(seq, chain_seq)[0].aligned
+    positions = np.concatenate([np.arange(*block) for block in blocks[0]])
+    chain_index = np.concatenate([np.arange(*block) for block in blocks[1]])
+    return positions, chain_index
 
-    xyz = ca_coords[["x", "y", "z"]].astype(float).values
-    cont_arr = (pairwise_distances(xyz) < dist_thres).astype(np.int32)
 
-    n, target_len = cont_arr.shape[0], len(seq)
-    if n == target_len:
-        return sparse.csr_matrix(cont_arr)
-    if n > target_len:
-        raise ValueError(f"{n} C-alpha atoms for {target_len} residues: {pdb_path}")
-    # Zero-padded float64 map with a unit diagonal. The original builds and normalises it in float64.
+def protein_contact_map(pdb_path, seq, dist_thres=10.0):
+    """Contact map over the dataset sequence as (csr matrix, aligned residues, aligned residues with the same letter).
+
+    The chain sequence is aligned to the dataset sequence. Each aligned C-alpha sits at its dataset position. Positions without
+    an aligned C-alpha have no contacts (a unit diagonal only), and chain residues without a partner are cut.
+    """
+    chain_seq, coords = chain_residues(pdb_path)
+    positions, chain_index = align_chain(chain_seq, seq)
+    n_match = sum(seq[p] == chain_seq[c] for p, c in zip(positions, chain_index))
+    cont_arr = (pairwise_distances(coords[chain_index]) < dist_thres).astype(np.int32) if len(positions) else np.zeros((0, 0), np.int32)
+    if len(positions) == len(seq):
+        return sparse.csr_matrix(cont_arr), len(positions), n_match
+    return padded_contact_map(cont_arr, len(seq), positions), len(positions), n_match
+
+
+def padded_contact_map(cont_arr, target_len, positions=None):
+    """Float64 map with a unit diagonal and contacts at the given positions (the first rows when None).
+
+    The original builds and normalises its padded map in float64. Without a structure, cont_arr is empty and the model sees only self-loops.
+    """
+    positions = np.arange(cont_arr.shape[0]) if positions is None else positions
     padded = np.zeros((target_len, target_len), dtype=np.float64)
-    padded[:n, :n] = cont_arr
+    padded[np.ix_(positions, positions)] = cont_arr
     np.fill_diagonal(padded, 1)
     return sparse.csr_matrix(padded)
 
 
 class FeatureCache:
-    def __init__(self, cache_dir):
+    def __init__(self, cache_dir, dict_hash):
+        self.dict_hash = dict_hash
         self.cache_root = _ensure_dir(Path(cache_dir) / f"features_{CACHE_VERSION}")
         self.seq_dir = _ensure_dir(self.cache_root / "sequence")
         self.smiles_dir = _ensure_dir(self.cache_root / "smiles")
@@ -226,16 +184,16 @@ class FeatureCache:
         return namespace_dir / key[:2] / f"{key}.{suffix}"
 
     def seq_key(self, sequence, ngram):
-        payload = f"{CACHE_VERSION}|seq|ngram={ngram}|{sequence}"
+        payload = f"{CACHE_VERSION}|seq|dicts={self.dict_hash}|ngram={ngram}|{sequence}"
         return _sha256_text(payload)
 
     def smiles_key(self, smiles, radius):
-        payload = f"{CACHE_VERSION}|smiles|radius={radius}|{smiles}"
+        payload = f"{CACHE_VERSION}|smiles|dicts={self.dict_hash}|radius={radius}|{smiles}"
         return _sha256_text(payload)
 
-    def struct_key(self, structure_path, sequence, dist_thres, chain_id):
+    def struct_key(self, structure_path, sequence, dist_thres):
         sig = _file_signature(structure_path)
-        payload = f"{CACHE_VERSION}|struct|dist={dist_thres}|chain={chain_id}|seq_len={len(sequence)}|{sig}"
+        payload = f"{CACHE_VERSION}|struct|dist={dist_thres}|seq={_sha256_text(sequence)}|{sig}"
         return _sha256_text(payload)
 
     def load_sequence(self, key):
@@ -276,27 +234,23 @@ class FeatureCache:
         os.replace(tmp, fpath)
 
     def load_structure(self, key):
+        """(csr matrix, aligned residues, matching aligned residues), or None."""
         fpath = self._path(self.struct_dir, key, "npz")
         if not fpath.exists():
             return None
         try:
-            return sparse.load_npz(fpath)
+            with np.load(fpath, allow_pickle=False) as data:
+                matrix = sparse.csr_matrix((data["data"], data["indices"], data["indptr"]), shape=tuple(data["shape"]))
+                return matrix, int(data["n_aligned"]), int(data["n_match"])
         except Exception:
             return None
 
-    def save_structure(self, key, matrix):
+    def save_structure(self, key, matrix, n_aligned, n_match):
         fpath = self._path(self.struct_dir, key, "npz")
         fpath.parent.mkdir(parents=True, exist_ok=True)
         tmp = fpath.with_suffix(f".tmp.{os.getpid()}.npz")
-        sparse.save_npz(tmp, matrix)
+        np.savez_compressed(tmp, data=matrix.data, indices=matrix.indices, indptr=matrix.indptr, shape=matrix.shape, n_aligned=n_aligned, n_match=n_match)
         os.replace(tmp, fpath)
-
-
-def resolve_structure_path(value, csv_path):
-    p = Path(str(value))
-    if p.is_absolute():
-        return str(p)
-    return str((Path(csv_path).parent / p).resolve())
 
 
 def atomic_save_object_array(path, values):

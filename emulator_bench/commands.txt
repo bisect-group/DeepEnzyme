@@ -8,12 +8,14 @@ OUT=$EM/outputs/baselines/DeepEnzyme
 
 # Defaults: --base_dir $DATA, --work_dir $OUT.
 # Runs:    $OUT/kcat/<split_group>/<split_name>/seed_N  (split_name is threshold_* or all)
-# Cache:   $OUT/embeddings/features_v3
+# Cache:   $OUT/embeddings/features_v6
+# Chains:  $OUT/structures/chains
 # Summary: $OUT/kcat/*.csv
 
-# Prepare structures, cache features and train every default split for three seeds.
+# Prepare structures, cache features and train every default split for three seeds (7 splits, 21 runs).
 # Split groups: random_splits_grouped_sequence, random_splits_grouped_smiles, uniprot_time_splits,
-# enzyme_sequence_splits/threshold_*, substrate_splits/threshold_* (thresholds are found on disk).
+# enzyme_sequence_splits, enzyme_structure_splits, substrate_splits, conformer_cosine_splits
+# (the three threshold groups use the threshold_* folder found on disk).
 CUDA_VISIBLE_DEVICES=0 $PY emulator_bench/run_split_benchmarks.py \
   --base_dir $DATA --work_dir $OUT --seeds 666 777 888
 
@@ -30,3 +32,25 @@ CUDA_VISIBLE_DEVICES=1 $PY emulator_bench/run_split_benchmarks.py \
 
 # Aggregate mean and std over seeds. Standalone scripts need explicit folders.
 $PY emulator_bench/aggregate_deepenzyme_results.py --results_dir $OUT/kcat
+
+# Check the wrapper against the original code (CPU, about 20 s). Add --gpu for the CUDA tests.
+bash emulator_bench/verify_equivalence.sh
+
+# Batched trainer: all pending runs of the selected splits and seeds in one process on one GPU (fp32).
+# Each run keeps its own batch-1 AdamW updates and writes the usual run folder. Resume needs all runs at the same epoch.
+CUDA_VISIBLE_DEVICES=1 $PY emulator_bench/run_split_benchmarks.py \
+  --base_dir $DATA --work_dir $OUT --seeds 666 777 888 --batched
+
+# Tests of the batched trainer (CPU, then GPU).
+CUDA_VISIBLE_DEVICES= $PY -m pytest emulator_bench/tests/test_batched.py -m "not gpu" -q
+CUDA_VISIBLE_DEVICES=1 $PY -m pytest emulator_bench/tests/test_batched.py -m gpu -q -s
+
+# Queue of all 21 default runs on one GPU: N single-run processes (default 6, cap 14% of GPU memory each), resume from checkpoints.
+# Build the feature folders first. Run inside a detached screen; per-run logs go to $OUT/logs.
+bash emulator_bench/build_all_features.sh
+CUDA_VISIBLE_DEVICES=1 bash emulator_bench/run_queue.sh 6
+
+# Lazy AdamW trainer (same flags as train_single_target_tvt.py, plus --sparse_adjacency) and its tests (CPU, then GPU).
+CUDA_VISIBLE_DEVICES=1 $PY emulator_bench/lazy_train.py --help
+CUDA_VISIBLE_DEVICES= $PY -m pytest emulator_bench/tests/test_lazy_adamw.py -m "not gpu" -q
+CUDA_VISIBLE_DEVICES=1 $PY -m pytest emulator_bench/tests/test_lazy_adamw.py -m gpu -q -s

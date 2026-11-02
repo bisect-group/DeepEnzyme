@@ -7,11 +7,11 @@ import torch.nn.functional as F
 
 
 def normalize_adj(adj):
+    """D^-1/2 A D^-1/2 as row and column scaling. Equal to the two dense products of the original, which only multiply by zeros off the diagonal."""
     rowsum = adj.sum(1)
     r_inv_sqrt = torch.pow(rowsum, -0.5)
     r_inv_sqrt[torch.isinf(r_inv_sqrt)] = 0
-    r_mat_inv_sqrt = torch.diag(r_inv_sqrt)
-    return torch.mm(torch.mm(r_mat_inv_sqrt, adj), r_mat_inv_sqrt)
+    return adj * r_inv_sqrt[:, None] * r_inv_sqrt[None, :]
 
 
 class GCNLayer(nn.Module):
@@ -103,7 +103,9 @@ class DeepEnzymeBench(nn.Module):
     def protein_gcn(self, adjacency, words, dropout):
         if hasattr(adjacency, "toarray"):
             adjacency = adjacency.toarray()
-        adjacency = torch.as_tensor(adjacency, device=words.device)
+        adjacency = torch.as_tensor(adjacency)
+        if words.is_cuda:
+            adjacency = adjacency.pin_memory().to(words.device, non_blocking=True)
         word_vectors = self.embed_wordGCN(words)
         return self.gcn(word_vectors, adjacency)
 

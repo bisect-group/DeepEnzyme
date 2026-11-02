@@ -7,7 +7,7 @@ Create a bench-owned EMULaToR workflow for DeepEnzyme that retrains on explicit 
 ## Implementation
 
 - Add parquet-native split discovery, manifest preparation, static feature caching, and result aggregation under `emulator_bench/`.
-- Resolve one structure per row by choosing the best aligned experimental PDB, then AlphaFold fallback, then ESM fallback.
+- Resolve one structure per unique sequence with the CatPred rule: best-coverage experimental mmCIF chain, then AlphaFold, ESMFold2, ESM3. Rows without a structure stay.
 - Cache only static DeepEnzyme inputs once: sequence token IDs, substrate fingerprints, substrate adjacency, and protein contact maps.
 - Use a bench-local DeepEnzyme-equivalent model implementation that removes hardcoded `.cuda()` calls.
 - Keep original default settings: `lr=0.001`, `iteration=200`, `dropout=0.3`, `dim=64`, `layer_output=3`, `hidden_dim1=64`, `hidden_dim2=64`, `nhead=4`, `hid_size=64`, `layers_trans=3`.

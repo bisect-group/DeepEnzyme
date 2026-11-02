@@ -56,8 +56,8 @@ def maybe_prepare(args):
         str(args.manifests_dir),
         "--target_col",
         args.source_target_col,
-        "--identity_threshold",
-        str(args.identity_threshold),
+        "--chains_dir",
+        str(args.chains_dir),
         "--split_groups",
         *args.split_groups,
     ]
@@ -125,6 +125,7 @@ def train_command(args, job, seed):
         cmd.extend(["--iteration", str(args.iteration)])
     if args.amp:
         cmd.append("--amp")
+    cmd.extend(flag for flag in ("--fp16", "--tf32", "--fused_adamw") if getattr(args, flag[2:]))
     if args.overwrite_runs:
         cmd.append("--overwrite")
     if args.hide_sample_progress:
@@ -135,6 +136,17 @@ def train_command(args, job, seed):
     if args.cpu_interop_threads_per_run is not None:
         cmd.extend(["--torch_num_interop_threads", str(args.cpu_interop_threads_per_run)])
     return cmd, out_dir
+
+
+def batched_command(args, tasks):
+    cmd = [sys.executable, "emulator_bench/batched_trainer.py", "--dict_dir", str(args.dict_dir), "--device", args.device]
+    if args.iteration is not None:
+        cmd.extend(["--iteration", str(args.iteration)])
+    if args.overwrite_runs:
+        cmd.append("--overwrite")
+    for job, seed, _, out_dir in tasks:
+        cmd.extend(["--job", *(str(feature_dir(args.features_dir, job, part)) for part in ("train", "val", "test")), str(out_dir), str(seed)])
+    return cmd
 
 
 def _gpu_list(args):
@@ -160,6 +172,12 @@ def run_training_tasks(args, jobs):
     gpus = _gpu_list(args)
     if not gpus:
         gpus = [""]
+    if args.batched:
+        env = os.environ.copy()
+        if gpus[0]:
+            env["CUDA_VISIBLE_DEVICES"] = gpus[0]
+        _run(batched_command(args, tasks), env=env, dry_run=args.dry_run)
+        return [{"split_group": job["split_group"], "split_name": job["split_name"], "seed": seed, "gpu": gpus[0], "out_dir": str(out_dir), "status": "completed"} for job, seed, _, out_dir in tasks]
     if args.runs_per_gpu <= 1 and len(gpus) == 1:
         env = os.environ.copy()
         if gpus[0]:
@@ -261,11 +279,11 @@ def main():
     parser.add_argument("--thresholds", nargs="+", default=None)
     parser.add_argument("--dict_dir", type=Path, default=REPO_ROOT / "Data/Input")
     parser.add_argument("--source_target_col", type=str, default="log10_value")
-    parser.add_argument("--identity_threshold", type=float, default=90.0)
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--cuda_visible_devices", type=str, default="")
     parser.add_argument("--gpus", nargs="+", default=None, help="Physical GPU ids to use for training workers, e.g. --gpus 2 or --gpus 0 1 2.")
+    parser.add_argument("--batched", action="store_true", help="Train all pending runs in one process on the first GPU (batched_trainer.py: fp32, one CUDA graph per run).")
     parser.add_argument("--runs_per_gpu", type=int, default=1, help="Concurrent training subprocesses to launch per GPU.")
     parser.add_argument("--cpu_threads_per_run", type=int, default=1, help="CPU BLAS/OpenMP/PyTorch intra-op threads per training subprocess. Use a larger value if CPU is underutilized.")
     parser.add_argument("--cpu_interop_threads_per_run", type=int, default=1, help="PyTorch inter-op CPU threads per training subprocess.")
@@ -277,6 +295,9 @@ def main():
     parser.add_argument("--overwrite_features", action="store_true")
     parser.add_argument("--overwrite_runs", action="store_true")
     parser.add_argument("--amp", action="store_true", help="Opt in to mixed precision. The original code trains in fp32.")
+    parser.add_argument("--fp16", action="store_true", help="fp16 autocast with GradScaler instead of the bf16 of --amp.")
+    parser.add_argument("--tf32", action="store_true", help="TF32 matrix multiplications.")
+    parser.add_argument("--fused_adamw", action="store_true", help="Fused AdamW kernel.")
     parser.add_argument("--hide_sample_progress", action="store_true", help="Hide train/val/test sample progress bars in training subprocesses.")
     parser.add_argument("--progress_interval", type=int, default=1000, help="Sample interval for live RMSE progress updates.")
     parser.add_argument("--keep_going", action="store_true", help="Continue other parallel jobs if one training subprocess fails.")
@@ -289,6 +310,7 @@ def main():
     args.manifests_dir = args.task_dir / "manifests"
     args.features_dir = args.task_dir / "features"
     args.cache_dir = args.work_dir / "embeddings"
+    args.chains_dir = args.work_dir / "structures" / "chains"
     args.results_dir = args.task_dir
 
     if args.runs_per_gpu < 1:
